@@ -1,0 +1,20 @@
+{
+  "id": "./",
+  "name": "Blackwhole — AI Chat by Mano Francis",
+  "short_name": "Blackwhole",
+  "description": "Free, fast AI chatbot by Mano Francis. No signup, no setup.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#06060e",
+  "theme_color": "#06060e",
+  "lang": "en",
+  "dir": "ltr",
+  "categories": ["productivity", "utilities"],
+  "icons": [
+    { "src": "assets/icons/favicon-192x192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "assets/icons/favicon-512x512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "assets/icons/maskable-512x512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

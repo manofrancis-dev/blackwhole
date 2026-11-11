@@ -1,0 +1,5 @@
+User-agent: *
+Allow: /
+
+# Sitemap for Google, Bing and other search engines
+Sitemap: https://manofrancis-dev.github.io/blackwhole/sitemap.xml
