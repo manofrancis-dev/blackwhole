@@ -691,6 +691,7 @@
     const shell = addAssistantShell();
     autoScroll(true);
     let full = "";
+    let partial = "";
     let gotFirst = false;
 
     const paint = (text) => {
@@ -702,11 +703,19 @@
 
     try {
       full = await AI.streamChat(settings, conv.messages, {
-        onDelta: (_delta, all) => paint(all),
+        onDelta: (_delta, all) => { partial = all; paint(all); },
         onRetry: (sec) => {
           shell._md.innerHTML =
             '<p class="retry-note">⏳ Free-tier limit hit — retrying in <b>' + sec + 's</b>…</p>';
           autoScroll();
+        },
+        onContinue: () => {
+          shell._md.innerHTML =
+            '<p class="retry-note">⏳ Continuing the answer…</p>';
+          autoScroll();
+        },
+        onTruncated: () => {
+          toast('Reply may be incomplete — send "continue" to keep going.');
         },
         signal: abortCtrl.signal,
       });
@@ -714,12 +723,19 @@
       saveChats();
     } catch (err) {
       if (err.name === "AbortError") {
-        if (full) {
-          conv.messages.push({ role: "assistant", content: full + "\n\n*(stopped)*" });
+        const kept = err.partial || partial || full;
+        if (kept) {
+          conv.messages.push({ role: "assistant", content: kept + "\n\n*(stopped)*" });
           saveChats();
         } else {
           shell._md.innerHTML = '<p style="color:var(--text-dim)">*Stopped.*</p>';
         }
+      } else if (partial) {
+        // Something interrupted the stream after text arrived: keep what the
+        // model already wrote instead of replacing it with a bare error.
+        conv.messages.push({ role: "assistant", content: partial });
+        saveChats();
+        toast(err.message || "Response interrupted", true);
       } else {
         shell._md.innerHTML =
           '<p class="error-text">⚠️ ' + (err.message || "Something went wrong.") + "</p>";
@@ -729,7 +745,7 @@
       streaming = false;
       abortCtrl = null;
       const last = conv.messages[conv.messages.length - 1];
-      const text = last && last.role === "assistant" ? last.content : full;
+      const text = last && last.role === "assistant" ? last.content : (partial || full);
       if (gotFirst && text) shell._md.innerHTML = Markdown.render(text);
       shell._md.classList.remove("streaming-cursor");
       addActions(shell, text || "", { regenerate: true });

@@ -52,6 +52,12 @@
     "Never say you are ChatGPT, GPT, Claude, Llama, or that you were made by OpenAI, " +
     "Groq, Meta, or any other company. Always answer as Blackwhole, created by Mano Francis.";
 
+  /* Sent when a reply hits the token cap or a stream drops mid-answer. */
+  const CONTINUE_PROMPT =
+    "Continue the previous answer from exactly where it stopped. " +
+    "Do not repeat anything you already wrote, do not apologise, and do not add a preamble. " +
+    "If you were in the middle of code, continue the code seamlessly from the last character.";
+
   function buildRequest(cfg, messages) {
     const p = PROVIDERS[cfg.provider] || PROVIDERS.openai;
     const base = (cfg.baseUrl || p.baseUrl).replace(/\/+$/, "");
@@ -88,10 +94,17 @@
     // Groq's free tier has a tight tokens-per-minute budget. Keep each request
     // small, and for gpt-oss models use light reasoning to save output tokens.
     const isGroq = cfg.provider === "groq";
+    // gpt-oss counts hidden reasoning against max_tokens, so a small cap like
+    // 1200 cut long code answers in half. Size the budget from the actual
+    // prompt instead, keeping the whole request under the free-tier TPM limit.
+    const promptTokens = msgs.reduce((n, m) => n + estimateTokens(m.content), 0) + estimateTokens(system) + 12;
+    const maxTokens = isGroq
+      ? Math.max(1200, Math.min(8192, 7400 - promptTokens))
+      : 4096;
     const body = {
       model,
       temperature: cfg.temperature ?? 0.7,
-      max_tokens: isGroq ? 1200 : 2048,
+      max_tokens: maxTokens,
       stream: true,
       messages: msgs,
     };
@@ -211,37 +224,66 @@
 
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
-    let buffer = "", full = "";
+    let buffer = "", full = "", finishReason = null, providerError = null;
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
+    const handleEvent = (ev) => {
+      for (const line of ev.split("\n")) {
+        const t = line.trim();
+        if (!t.startsWith("data:")) continue;
+        const payload = t.slice(5).trim();
+        if (!payload || payload === "[DONE]") continue;
+        let json;
+        try { json = JSON.parse(payload); } catch { continue; }
 
-      const events = buffer.split("\n\n");
-      buffer = events.pop(); // keep incomplete tail
-
-      for (const ev of events) {
-        for (const line of ev.split("\n")) {
-          const t = line.trim();
-          if (!t.startsWith("data:")) continue;
-          const payload = t.slice(5).trim();
-          if (!payload || payload === "[DONE]") continue;
-          let json;
-          try { json = JSON.parse(payload); } catch { continue; }
-          const delta = extractDelta(p.style, json);
-          if (delta) {
-            full += delta;
-            if (onDelta) onDelta(delta, full);
-          }
+        // Some providers send an error object inside the stream instead of
+        // closing the connection cleanly.
+        if (json.error) {
+          providerError = new Error(json.error.message || "The provider stopped the response.");
+          providerError.status = json.error.code || json.error.status;
+          continue;
         }
+
+        const delta = extractDelta(p.style, json);
+        if (delta) {
+          full += delta;
+          if (onDelta) onDelta(delta, full);
+        }
+        const fr = json.choices && json.choices[0] && json.choices[0].finish_reason;
+        if (fr) finishReason = fr;
       }
+    };
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        // Accept both LF and CRLF separated SSE events (proxies differ).
+        const events = buffer.split(/\r?\n\r?\n/);
+        buffer = events.pop(); // keep incomplete tail
+
+        for (const ev of events) handleEvent(ev);
+      }
+      if (buffer.trim()) handleEvent(buffer);
+    } catch (err) {
+      if (err && err.name === "AbortError") {
+        const e = new Error("Aborted");
+        e.name = "AbortError";
+        e.partial = full;
+        throw e;
+      }
+      // A dropped connection after some text arrived: keep the partial answer
+      // and let the caller resume it instead of throwing everything away.
+      if (full.trim()) return { text: full, finishReason, incomplete: true };
+      throw err;
     }
 
     if (!full.trim()) {
+      if (providerError) throw providerError;
       throw new Error("Empty response from provider. Check the model name in Settings.");
     }
-    return full;
+    return { text: full, finishReason, incomplete: false };
   }
 
   /* Abort-aware delay used between rate-limit retries. */
@@ -270,9 +312,12 @@
    * Stream a chat completion. Long conversations are trimmed to fit the plan's
    * tokens-per-minute (TPM) limit, and free-tier rate limits are handled
    * automatically: the client waits and retries instead of failing.
+   * If the model stops because it hit the token cap (finish_reason=length) or
+   * the connection drops mid-answer, the answer is continued automatically so
+   * the user never gets a half-finished reply.
    * @param {object} cfg  {provider, apiKey, baseUrl, model, systemPrompt, temperature}
    * @param {Array}  messages  [{role:'user'|'assistant', content}]
-   * @param {object} handlers  {onDelta(text), onRetry(seconds, attempt), signal}
+   * @param {object} handlers  {onDelta(text, full), onRetry(seconds, attempt), onContinue(n), onTruncated(), signal}
    * @returns {Promise<string>} full assistant text
    */
   async function streamChat(cfg, messages, handlers = {}) {
@@ -287,14 +332,49 @@
     // Groq free tier = ~8,000 tokens/minute. Keep the whole request small.
     let budget = isGroq ? 1800 : 24000;
     let msgs = messages;
+    let answer = "";
     let shrinks = 0;
     let retries = 0;
+    let continuations = 0;
     const MAX_RETRIES = 6;
+    const MAX_CONTINUATIONS = 4;
 
     while (true) {
       try {
-        return await attempt(cfg, trimHistory(msgs, budget), handlers);
+        const res = await attempt(cfg, trimHistory(msgs, budget), {
+          signal: handlers.signal,
+          onDelta: (delta, localFull) => {
+            if (handlers.onDelta) handlers.onDelta(delta, answer + localFull);
+          },
+        });
+        answer += res.text;
+
+        // The model ran out of output tokens or the stream was cut off:
+        // ask it to carry on, seamlessly, from the last character it wrote.
+        const cutOff = res.finishReason === "length" || res.incomplete;
+        if (cutOff && !(handlers.signal && handlers.signal.aborted)) {
+          if (continuations < MAX_CONTINUATIONS) {
+            continuations++;
+            if (handlers.onContinue) handlers.onContinue(continuations);
+            const tail = answer.slice(-3000);
+            msgs = messages.slice(-1).concat([
+              { role: "assistant", content: tail },
+              { role: "user", content: CONTINUE_PROMPT },
+            ]);
+            budget = isGroq ? 1800 : 24000;
+            continue;
+          }
+          // Gave up after several resumes: tell the UI so it can offer "continue".
+          if (handlers.onTruncated) handlers.onTruncated();
+        }
+
+        return answer;
       } catch (err) {
+        if (err && err.name === "AbortError") {
+          // Keep everything already streamed so "Stop" never wipes the reply.
+          err.partial = answer + (err.partial || "");
+          throw err;
+        }
         if (handlers.signal && handlers.signal.aborted) throw err;
 
         // Too large for the plan (usually a single very long message):
