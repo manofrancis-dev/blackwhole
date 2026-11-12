@@ -190,7 +190,8 @@
   });
 
   /* ---------- Sidebar ---------- */
-  function isMobile() { return window.matchMedia("(max-width: 820px)").matches; }
+  const mobileQuery = window.matchMedia("(max-width: 820px), (max-height: 560px) and (orientation: landscape)");
+  function isMobile() { return mobileQuery.matches; }
   function openSidebar() {
     $("sidebar").classList.remove("collapsed");
     document.body.classList.add("sidebar-open");
@@ -204,6 +205,15 @@
   });
   $("sidebarClose").addEventListener("click", closeSidebar);
   $("sidebarOverlay").addEventListener("click", closeSidebar);
+
+  // Rotation or a window resize can cross the drawer breakpoint. Reset to the
+  // correct default instead of leaving a fixed drawer floating over the chat.
+  if (mobileQuery.addEventListener) {
+    mobileQuery.addEventListener("change", (e) => {
+      if (e.matches) closeSidebar();
+      else { $("sidebar").classList.remove("collapsed"); document.body.classList.remove("sidebar-open"); }
+    });
+  }
 
   /* ---------- Chat search ---------- */
   const searchInput = $("searchInput");
@@ -581,18 +591,27 @@
 
   function autoGrow() {
     input.style.height = "auto";
-    // Cap the box on phones so the composer never swallows the message area.
-    const limit = Math.min(200, Math.max(96, Math.round(window.innerHeight * 0.32)));
+    // Cap the box so the composer never swallows the message area on phones.
+    const viewportH = (window.visualViewport && window.visualViewport.height) || window.innerHeight;
+    const limit = Math.min(200, Math.max(96, Math.round(viewportH * 0.32)));
     input.style.height = Math.min(input.scrollHeight, limit) + "px";
   }
   input.addEventListener("input", () => { autoGrow(); updateSendBtn(); });
 
-  // Phone keyboards and rotation resize the viewport: re-measure the input
-  // and stay pinned to the newest message so the composer is always usable.
+  // Phone keyboards and rotation resize the viewport: resync the app height,
+  // re-measure the input and keep the newest message visible.
+  function syncAppHeight() {
+    const h = (window.visualViewport && window.visualViewport.height) || window.innerHeight;
+    if (h > 200) {
+      document.documentElement.style.setProperty("--app-height", Math.round(h) + "px");
+    }
+  }
   function onViewportChange() {
+    syncAppHeight();
     autoGrow();
     autoScroll();
   }
+  syncAppHeight();
   if (window.visualViewport) {
     window.visualViewport.addEventListener("resize", onViewportChange);
   }

@@ -151,6 +151,9 @@ body, .chat-header, .composer, .modal, .suggestion, .user-bubble,
   /* dvh follows the real visible area on phones (address bar + keyboard),
      so the composer can never hide behind the browser chrome. */
   height: 100dvh;
+  /* JS keeps this in sync with visualViewport so iOS keyboard changes
+     resize the app instead of covering the composer. */
+  height: var(--app-height, 100dvh);
   overflow: hidden;
 }
 
@@ -910,7 +913,9 @@ html[data-theme="light"] .md code:not(pre code) { color: #6a3ff0; }
   padding: 7px 0;
   line-height: 1.5;
   color: var(--text);
-  font-size: 15.5px;
+  /* 16px everywhere: below this iOS Safari zooms the page when the field
+     is focused, which is what broke the mobile composer. */
+  font-size: 16px;
 }
 #input::placeholder { color: var(--text-dim); }
 
@@ -1365,8 +1370,9 @@ html[data-theme="light"] .md code:not(pre code) { color: #6a3ff0; }
 
 /* ============================================================
    Responsive — tablets and phones
+   (landscape phones are wider than 820px, but still short)
    ============================================================ */
-@media (max-width: 820px) {
+@media (max-width: 820px), (max-height: 560px) and (orientation: landscape) {
   /* --- sidebar becomes a slide-in drawer --- */
   .sidebar {
     position: fixed;
@@ -1498,7 +1504,7 @@ html[data-theme="light"] .md code:not(pre code) { color: #6a3ff0; }
   .welcome-sub { font-size: 12.5px; }
   .suggestion { padding: 11px 12px; }
   .composer { padding-left: 12px; }
-  .send-btn { width: 38px; height: 38px; }
+  .send-btn { width: 40px; height: 40px; }
   #input { font-size: 16px; }
   .disclaimer { font-size: 10px; }
   .settings-row { font-size: 12.5px; padding: 8px 10px; }
