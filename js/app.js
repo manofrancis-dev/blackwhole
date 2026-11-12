@@ -581,9 +581,23 @@
 
   function autoGrow() {
     input.style.height = "auto";
-    input.style.height = Math.min(input.scrollHeight, 200) + "px";
+    // Cap the box on phones so the composer never swallows the message area.
+    const limit = Math.min(200, Math.max(96, Math.round(window.innerHeight * 0.32)));
+    input.style.height = Math.min(input.scrollHeight, limit) + "px";
   }
   input.addEventListener("input", () => { autoGrow(); updateSendBtn(); });
+
+  // Phone keyboards and rotation resize the viewport: re-measure the input
+  // and stay pinned to the newest message so the composer is always usable.
+  function onViewportChange() {
+    autoGrow();
+    autoScroll();
+  }
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener("resize", onViewportChange);
+  }
+  window.addEventListener("orientationchange", () => setTimeout(onViewportChange, 250));
+  window.addEventListener("resize", onViewportChange);
 
   function updateSendBtn() {
     if (streaming) {
