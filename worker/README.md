@@ -50,10 +50,28 @@ That's it — no code change, no redeploy, the site keeps working.
 |---|---|
 | `GET /health` | `{ ok: true }` — use for uptime checks |
 | `POST /v1/*` | Proxied to `https://api.groq.com/openai/v1/*` (SSE streams pass through) |
+| `POST /tools/search` `{ q }` | Keyless web search → `{ source, results: [{title, url, snippet}] }` |
+| `POST /tools/read` `{ url }` | Fetch a page, strip HTML → `{ text }` (plain text, ~8k cap, 10 s timeout) |
+
+Search sources are tried in order and the first that returns results wins:
+`brave` (only if the `BRAVE_API_KEY` secret is set — best quality, free tier
+2k/month) → `duckduckgo` → `mojeek` → `google-news` → `gdelt` (real-time
+news, max 1 req / 5 s) → `hn` (Hacker News) → `wikipedia` → `bing-rss`.
+
+Verified live from Cloudflare (Nov 2026): DuckDuckGo Lite and Google News
+RSS are blocked/challenged from worker IPs (`525` / `503`), Bing RSS returns
+unrelated results — so in production GDELT / HN answer news queries and
+Wikipedia answers fact queries. Run `/tools/search?debug=1` to see each
+source's error. Add a `BRAVE_API_KEY` secret for Google-quality relevance:
+
+```bash
+npx wrangler secret put BRAVE_API_KEY   # https://brave.com/search/api/
+```
 
 ## Configuration
 
 - `GROQ_API_KEY` — secret, set via `wrangler secret put`
+- `BRAVE_API_KEY` — optional secret; enables the best search source
 - `ALLOWED_ORIGINS` — var in `wrangler.toml`; only these origins may call the
   proxy (site + local dev). Everyone else gets no CORS header.
 

@@ -714,6 +714,20 @@
     ].join("\n");
   }
 
+  /* Long-term memory facts (Fix 4a), stored by the remember/forget tools
+     in localStorage and injected into every request so past chats carry
+     forward. Zero API change — rides on clientContext. */
+  function memoryContext() {
+    const mem = (window.AI.memoryFacts && window.AI.memoryFacts()) || [];
+    if (!mem.length) return "";
+    const lines = mem.map((f, i) => (i + 1) + ". " + f.fact);
+    return [
+      "LONG-TERM MEMORY (facts remembered from past conversations — use them",
+      "naturally when relevant, e.g. the user's name; do not recite this list):",
+      lines.join("\n"),
+    ].join("\n");
+  }
+
   async function runAssistant(conv) {
     streaming = true;
     abortCtrl = new AbortController();
@@ -734,7 +748,7 @@
 
     try {
       full = await AI.streamChat(
-        { ...settings, clientContext: realtimeContext(), tools: AI.toolkit() },
+        { ...settings, clientContext: [realtimeContext(), memoryContext()].filter(Boolean).join("\n\n"), tools: AI.toolkit() },
         conv.messages,
         {
           onDelta: (_delta, all) => { partial = all; paint(all); },
@@ -751,6 +765,11 @@
           onToolCall: (name) => {
             const label = name === "get_weather" ? "🌦️ Checking live weather…"
               : name === "get_current_datetime" ? "🕒 Checking the exact time…"
+              : name === "web_search" ? "🔎 Searching the web…"
+              : name === "read_webpage" ? "📄 Reading the page…"
+              : name === "count_text" ? "🔢 Verifying the counts…"
+              : name === "remember" ? "🧠 Saving to long-term memory…"
+              : name === "forget" ? "🧠 Updating long-term memory…"
               : "🛠️ Using a tool…";
             shell._md.innerHTML = '<p class="retry-note">' + label + "</p>";
             autoScroll();

@@ -6,6 +6,8 @@
    Endpoints:
      GET  /health             -> { ok: true }
      POST /v1/<groq-path>     -> forwarded to https://api.groq.com/openai/v1/<groq-path>
+     POST /tools/search {q}   -> keyless web search (DuckDuckGo Lite, Wikipedia fallback)
+     POST /tools/read   {url} -> fetch a page, strip HTML to plain text (~8k cap)
 
    Secrets (set with: npx wrangler secret put GROQ_API_KEY):
      GROQ_API_KEY            Groq key used for every upstream request.
@@ -14,6 +16,206 @@
      ALLOWED_ORIGINS         Comma-separated origins allowed to call this proxy. */
 
 const GROQ_BASE = "https://api.groq.com/openai/v1";
+const BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+/* ---------- HTML helpers for the keyless web tools ---------- */
+
+const ENTITIES = {
+  amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ", ndash: "–", mdash: "—",
+};
+
+function decodeEntities(s) {
+  return String(s)
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(+n))
+    .replace(/&([a-z]+);/gi, (m, name) => ENTITIES[name.toLowerCase()] ?? m);
+}
+
+/* Strip scripts/styles/tags/comments and collapse whitespace to plain text. */
+function htmlToText(html) {
+  return decodeEntities(
+    String(html)
+      .replace(/<!--[\s\S]*?-->/g, " ")
+      .replace(/<(script|style|noscript|svg|template)[\s\S]*?<\/\1>/gi, " ")
+      .replace(/<[^>]+>/g, " ")
+  ).replace(/[ \t\r]+/g, " ").replace(/\n\s*\n+/g, "\n").trim();
+}
+
+/* Keyless search via DuckDuckGo Lite (HTML scrape), tolerant of attribute
+   order; returns [{title, url, snippet}]. */
+async function searchDuckDuckGo(q) {
+  const res = await fetch("https://lite.duckduckgo.com/lite/?q=" + encodeURIComponent(q), {
+    headers: { "user-agent": BROWSER_UA, "accept-language": "en" },
+  });
+  if (!res.ok) throw new Error("DDG HTTP " + res.status);
+  const html = await res.text();
+  const snips = [...html.matchAll(/<t[dh][^>]*class=["']result-snippet["'][^>]*>([\s\S]*?)<\/t[dh]>/gi)].map(m => htmlToText(m[1]));
+  const results = [];
+  let i = 0;
+  for (const m of html.matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a>/gi)) {
+    const attrs = m[1] || "";
+    if (!/rel="nofollow"|result-link/i.test(attrs)) continue;
+    if (/\/y\.js|ad_provider|ad_domain/i.test(attrs)) continue; // skip ads
+    const href = (/href=["']([^"']+)["']/i.exec(attrs) || [])[1];
+    if (!href) continue;
+    let url = href;
+    // Lite wraps targets in a redirect: //duckduckgo.com/l/?uddg=<encoded>
+    const uddg = /uddg=([^&]+)/.exec(url);
+    if (uddg) { try { url = decodeURIComponent(uddg[1]); } catch { continue; } }
+    if (!/^https?:\/\//i.test(url)) continue;
+    const title = htmlToText(m[2]);
+    if (!title) continue;
+    results.push({ title, url, snippet: (snips[i] || "").slice(0, 300) });
+    if (++i >= 5) break;
+  }
+  return results;
+}
+
+/* Keyless fallback: Wikipedia site search. */
+async function searchWikipedia(q) {
+  const res = await fetch(
+    "https://en.wikipedia.org/w/api.php?action=query&list=search&format=json&srlimit=5&srsearch=" +
+    encodeURIComponent(q),
+    { headers: { "user-agent": "BlackwholeProxy/1.0" } }
+  );
+  if (!res.ok) throw new Error("Wikipedia HTTP " + res.status);
+  const j = await res.json();
+  return ((j.query && j.query.search) || []).map(r => ({
+    title: r.title,
+    url: "https://en.wikipedia.org/wiki/" + encodeURIComponent(String(r.title).replace(/ /g, "_")),
+    snippet: htmlToText(r.snippet || "").slice(0, 300),
+  }));
+}
+
+/* Minimal RSS <item> parser for keyless search feeds (Bing). */
+function parseRssItems(xml, cap) {
+  const out = [];
+  const itemRe = /<item>([\s\S]*?)<\/item>/gi;
+  let m;
+  while ((m = itemRe.exec(xml)) && out.length < cap) {
+    const block = m[1];
+    const pick = (tag) => {
+      const t = new RegExp("<" + tag + "[^>]*>([\\s\\S]*?)</" + tag + ">", "i").exec(block);
+      if (!t) return "";
+      return decodeEntities(t[1].replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")).trim();
+    };
+    const title = htmlToText(pick("title"));
+    const link = pick("link");
+    if (title && /^https?:\/\//i.test(link)) {
+      out.push({ title, url: link, snippet: htmlToText(pick("description")).slice(0, 300) });
+    }
+  }
+  return out;
+}
+
+/* Keyless general search via Mojeek (independent index, bot-friendly). */
+async function searchMojeek(q) {
+  const res = await fetch("https://www.mojeek.com/search?q=" + encodeURIComponent(q), {
+    headers: { "user-agent": BROWSER_UA, "accept-language": "en" },
+  });
+  if (!res.ok) throw new Error("Mojeek HTTP " + res.status);
+  const html = await res.text();
+  const results = [];
+  for (const m of html.matchAll(/<li\b[^>]*>([\s\S]*?)<\/li>/gi)) {
+    const block = m[1];
+    const linkM = /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/i.exec(block);
+    if (!linkM) continue;
+    const url = linkM[1];
+    if (!/^https?:\/\//i.test(url) || /mojeek\.com/i.test(url)) continue;
+    const title = htmlToText(linkM[2]);
+    if (!title) continue;
+    const snipM = /<p\b[^>]*class=["'][^"']*\bs["'][^>]*>([\s\S]*?)<\/p>/i.exec(block);
+    results.push({ title, url, snippet: snipM ? htmlToText(snipM[1]).slice(0, 300) : "" });
+    if (results.length >= 5) break;
+  }
+  return results;
+}
+
+/* Highest-quality option: Brave Search API — needs a key, so it is only
+   used when the BRAVE_API_KEY worker secret is set (free tier: 2k/month). */
+async function searchBrave(q, env) {
+  if (!env.BRAVE_API_KEY) throw new Error("BRAVE_API_KEY secret not set");
+  const res = await fetch(
+    "https://api.search.brave.com/res/v1/web/search?q=" + encodeURIComponent(q) + "&count=5",
+    { headers: { "x-subscription-token": env.BRAVE_API_KEY, "accept": "application/json" } }
+  );
+  if (!res.ok) throw new Error("Brave HTTP " + res.status);
+  const j = await res.json();
+  return ((j.web && j.web.results) || []).slice(0, 5).map(r => ({
+    title: r.title,
+    url: r.url,
+    snippet: String(r.description || "").replace(/<[^>]+>/g, "").slice(0, 300),
+  }));
+}
+
+/* Keyless real-time news via GDELT (1 req / 5 s — one retry on 429). */
+async function searchGdelt(q) {
+  const call = async () => {
+    const u = "https://api.gdeltproject.org/api/v2/doc/doc?query=" +
+      encodeURIComponent(q) + "%20sourcelang:eng&mode=artlist&maxrecords=6&format=json&sort=datedesc";
+    const res = await fetch(u, { headers: { "user-agent": "BlackwholeProxy/1.0" } });
+    if (res.status === 429) throw Object.assign(new Error("GDELT rate limited"), { rate: true });
+    if (!res.ok) throw new Error("GDELT HTTP " + res.status);
+    const text = await res.text();
+    let j;
+    try { j = JSON.parse(text); } catch { throw new Error("GDELT bad response"); }
+    return (j.articles || []).map(a => ({
+      title: a.title,
+      url: a.url,
+      snippet: [a.domain, a.seendate].filter(Boolean).join(" • ").slice(0, 300),
+    })).filter(r => r.title && r.url);
+  };
+  try {
+    return await call();
+  } catch (e) {
+    if (e && e.rate) {
+      await new Promise(r => setTimeout(r, 5200)); // respect the 5 s limit once
+      return await call();
+    }
+    throw e;
+  }
+}
+
+/* Keyless tech-news via the Hacker News (Algolia) API. */
+async function searchHackerNews(q) {
+  const res = await fetch(
+    "https://hn.algolia.com/api/v1/search_by_date?query=" + encodeURIComponent(q) +
+    "&tags=story&hitsPerPage=6",
+    { headers: { "user-agent": "BlackwholeProxy/1.0" } }
+  );
+  if (!res.ok) throw new Error("HN HTTP " + res.status);
+  const j = await res.json();
+  return (j.hits || []).map(h => ({
+    title: h.title || h.story_title || "HN discussion",
+    url: h.url || ("https://news.ycombinator.com/item?id=" + h.objectID),
+    snippet: [
+      (h.points != null ? h.points + " points" : ""),
+      (h.num_comments != null ? h.num_comments + " comments" : ""),
+      h.created_at,
+    ].filter(Boolean).join(" • "),
+  })).filter(r => r.title && r.url).slice(0, 5);
+}
+
+/* Keyless news search via Google News RSS — reliable from Cloudflare. */
+async function searchGoogleNewsRss(q) {
+  const res = await fetch(
+    "https://news.google.com/rss/search?q=" + encodeURIComponent(q) + "&hl=en-US&gl=US&ceid=US:en",
+    { headers: { "user-agent": BROWSER_UA } }
+  );
+  if (!res.ok) throw new Error("GoogleNews HTTP " + res.status);
+  return parseRssItems(await res.text(), 5);
+}
+
+/* Keyless general search via Bing's RSS endpoint — reachable from
+   Cloudflare Workers, where DuckDuckGo Lite is blocked (HTTP 525). */
+async function searchBingRss(q) {
+  const res = await fetch(
+    "https://www.bing.com/search?q=" + encodeURIComponent(q) + "&format=rss&count=8",
+    { headers: { "user-agent": BROWSER_UA } }
+  );
+  if (!res.ok) throw new Error("Bing HTTP " + res.status);
+  return parseRssItems(await res.text(), 5);
+}
 
 function allowedOrigins(env) {
   return (env.ALLOWED_ORIGINS ||
@@ -53,6 +255,83 @@ export default {
 
     if (request.method !== "POST") {
       return json({ error: { message: "Method not allowed. Use POST." } }, 405, cors);
+    }
+
+    /* ---- keyless web tools (no GROQ_API_KEY needed) ---- */
+
+    if (url.pathname === "/tools/search") {
+      let q = "";
+      try { q = String((await request.json()).q || "").trim(); } catch { /* bad body */ }
+      if (!q) return json({ error: { message: "Missing q." } }, 400, cors);
+      const debug = url.searchParams.get("debug") === "1";
+      const errors = debug ? {} : null;
+      let results = [], source = "";
+      const trySource = async (name, fn) => {
+        try {
+          const r = await fn();
+          if (r.length) { source = name; results = r; return true; }
+        } catch (e) {
+          if (errors) errors[name] = String((e && e.message) || e);
+        }
+        return false;
+      };
+      if (await trySource("brave", () => searchBrave(q, env)) ||
+          await trySource("duckduckgo", () => searchDuckDuckGo(q)) ||
+          await trySource("mojeek", () => searchMojeek(q)) ||
+          await trySource("google-news", () => searchGoogleNewsRss(q)) ||
+          await trySource("gdelt", () => searchGdelt(q)) ||
+          await trySource("hn", () => searchHackerNews(q)) ||
+          await trySource("wikipedia", () => searchWikipedia(q)) ||
+          await trySource("bing-rss", () => searchBingRss(q))) { /* got results */ }
+      if (!results.length) {
+        return json({ error: { message: "No results found — search sources are unavailable right now." }, errors }, 502, cors);
+      }
+      return json({ source, results: results.slice(0, 5), errors }, 200, cors);
+    }
+
+    if (url.pathname === "/tools/read") {
+      let target = "";
+      try { target = String((await request.json()).url || "").trim(); } catch { /* bad body */ }
+      if (!/^https?:\/\//i.test(target)) {
+        return json({ error: { message: "Missing or invalid url (must start with http:// or https://)." } }, 400, cors);
+      }
+      let host = "";
+      try { host = new URL(target).hostname; } catch {
+        return json({ error: { message: "Invalid url." } }, 400, cors);
+      }
+      // Refuse to read this proxy itself — a self-fetch would recurse.
+      if (host === url.hostname) {
+        return json({ error: { message: "Refusing to read this proxy." } }, 400, cors);
+      }
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 10000);
+      try {
+        const upstream = await fetch(target, {
+          signal: ctrl.signal,
+          redirect: "follow",
+          headers: { "user-agent": BROWSER_UA, "accept": "text/html,application/xhtml+xml,text/plain,*/*" },
+        });
+        const ct = upstream.headers.get("content-type") || "";
+        if (!upstream.ok) {
+          return json({ error: { message: "Upstream HTTP " + upstream.status + " for " + host } }, 502, cors);
+        }
+        const body = await upstream.text();
+        const text = (/html|xml/i.test(ct) || /^\s*</.test(body) ? htmlToText(body) : body)
+          .slice(0, 8000);
+        return json({
+          url: upstream.url || target,
+          content_type: ct,
+          truncated: text.length >= 8000,
+          text,
+        }, 200, cors);
+      } catch (e) {
+        const msg = e && e.name === "AbortError"
+          ? "timed out after 10 s"
+          : ((e && e.message) || "fetch failed");
+        return json({ error: { message: "Could not read page: " + msg } }, 502, cors);
+      } finally {
+        clearTimeout(timer);
+      }
     }
 
     if (!env.GROQ_API_KEY) {

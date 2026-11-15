@@ -85,14 +85,23 @@
     "value you know with confidence and state the year. Never present a superseded " +
     "value as current — e.g. Croatia uses the euro (adopted 1 Jan 2023, kuna retired); " +
     "Kazakhstan's capital is Astana again (renamed back in 2022). If unsure of the " +
-    "latest value, say so and give the last value you are sure of, with its year.\n" +
+    "latest value, say so and give the last value you are sure of, with its year. " +
+    "For anything recent or current (news, events, releases, prices, \"latest\" " +
+    "versions, this week/month), call the web_search tool FIRST and cite the " +
+    "source URLs in the answer.\n" +
     "3. For form-constrained writing (haiku, rhymes, acrostics, letter-avoidance, " +
-    "fixed counts), verify EVERY line against the constraint before finishing. " +
-    "Explicitly count syllables, letters, or sentences; a haiku is exactly 5-7-5. " +
-    "If a line violates the constraint, silently rewrite it — never ship a line " +
-    "that breaks the requested form.\n" +
+    "fixed counts), call the count_text tool on your draft and verify EVERY line " +
+    "against the constraint from its exact output — never count in your head; " +
+    "a haiku is exactly 5-7-5 syllables. If a line violates the constraint, " +
+    "silently rewrite it and re-check with the tool — never ship a line that " +
+    "breaks the requested form. If the tool is unavailable, say the count is an " +
+    "estimate.\n" +
     "4. Do not invent people, events, numbers, or details to fill gaps. Saying " +
-    "\"I'm not certain\" is always better than a plausible-sounding guess.";
+    "\"I'm not certain\" is always better than a plausible-sounding guess.\n" +
+    "5. If a request is ambiguous or missing a key detail (which date? which " +
+    "version? which of several possible meanings?), ask ONE short clarifying " +
+    "question first instead of guessing. If the most likely reading is obvious, " +
+    "answer it and note the assumption in one line.";
 
   /* Sent when a reply hits the token cap or a stream drops mid-answer. */
   const CONTINUE_PROMPT =
@@ -100,13 +109,14 @@
     "Do not repeat anything you already wrote, do not apologise, and do not add a preamble. " +
     "If you were in the middle of code, continue the code seamlessly from the last character.";
 
-  function buildRequest(cfg, messages) {
+  function buildRequest(cfg, messages, systemExtra) {
     const p = PROVIDERS[cfg.provider] || PROVIDERS.openai;
     const base = (cfg.baseUrl || p.baseUrl).replace(/\/+$/, "");
     const model = cfg.model || p.defaultModel;
     /* clientContext carries fresh real-time facts (date/time/timezone) built
-       by the UI on every send, so the model never guesses them. */
-    const system = [IDENTITY_PROMPT, ACCURACY_PROMPT, cfg.systemPrompt, cfg.clientContext].filter(Boolean).join("\n\n");
+       by the UI on every send, so the model never guesses them. systemExtra
+       carries the rolling summary of messages compacted away by trimming. */
+    const system = [IDENTITY_PROMPT, ACCURACY_PROMPT, cfg.systemPrompt, cfg.clientContext, systemExtra].filter(Boolean).join("\n\n");
 
     if (p.style === "anthropic") {
       const body = {
@@ -288,9 +298,30 @@
     return kept.filter(m => m.role !== "tool" || hasCall.has(m.tool_call_id));
   }
 
-  async function attempt(cfg, messages, { onDelta, signal } = {}) {
+  /* ---------- Rolling summary (Fix 4b) ----------
+     When trimHistory() would discard the oldest messages (TPM budget),
+     fold their key contents into a compact note that is merged into the
+     system prompt, so early details survive long chats. Mechanical and
+     deterministic: rebuilt from the same history every request, no extra
+     API call needed. */
+  function buildSummaryNote(dropped) {
+    const parts = [];
+    for (const m of dropped) {
+      if (m.role !== "user" && m.role !== "assistant") continue;
+      const text = String(m.content || "").replace(/\s+/g, " ").trim();
+      if (!text) continue;
+      parts.push((m.role === "user" ? "User: " : "Assistant: ") +
+        text.slice(0, 240) + (text.length > 240 ? "…" : ""));
+    }
+    if (!parts.length) return "";
+    // Cap the note (~15 turns) so it stays small enough to always fit.
+    return "EARLIER IN THIS CONVERSATION (older messages were compacted; " +
+      "these are their key contents):\n" + parts.slice(-15).join("\n");
+  }
+
+  async function attempt(cfg, messages, { onDelta, signal, systemExtra } = {}) {
     const p = PROVIDERS[cfg.provider] || PROVIDERS.openai;
-    const req = buildRequest(cfg, messages);
+    const req = buildRequest(cfg, messages, systemExtra);
     let res;
     try {
       res = await fetch(req.url, {
@@ -458,8 +489,17 @@
 
     while (true) {
       try {
-        const res = await attempt(cfg, trimHistory(msgs, budget), {
+        // Trim to the token budget; whatever falls off the front is folded
+        // into a rolling summary note merged into the system prompt, so
+        // long chats keep their early details (Fix 4b).
+        const trimmed = trimHistory(msgs, budget);
+        let systemExtra = "";
+        if (trimmed.length < msgs.length) {
+          systemExtra = buildSummaryNote(msgs.slice(0, msgs.length - trimmed.length));
+        }
+        const res = await attempt(cfg, trimmed, {
           signal: handlers.signal,
+          systemExtra,
           onDelta: (delta, localFull) => {
             if (handlers.onDelta) handlers.onDelta(delta, answer + localFull);
           },
@@ -689,6 +729,133 @@
     });
   }
 
+  /* ---------- count_text (Fix 2): exact text statistics ----------
+     The model cannot count reliably in its head, so form-constrained
+     writing (haiku 5-7-5, character limits, word limits) is verified by
+     running this tool on the draft instead. */
+  function syllablesInWord(raw) {
+    /* Standard English heuristic: vowel groups, silent trailing e
+       (kept for -le endings), leading y silent. An estimate, not a
+       dictionary lookup — good enough to catch wrong line lengths. */
+    const w = String(raw).toLowerCase().replace(/[^a-z]/g, "");
+    if (!w) return 0;
+    if (w.length <= 3) return 1;
+    const stripped = w
+      .replace(/(?:[^laeiouy]es|ed|[^laeiouy]e)$/, "")
+      .replace(/^y/, "");
+    const groups = stripped.match(/[aeiouy]{1,2}/g);
+    return groups ? groups.length : 1;
+  }
+
+  function toolCountText(args) {
+    const text = String((args && args.text) || "");
+    if (!text.trim()) throw new Error("Missing text");
+    const wordsIn = (s) => s.match(/[A-Za-z0-9'’-]+/g) || [];
+    const statLine = (s) => {
+      const words = wordsIn(s);
+      return {
+        text: s,
+        characters: s.length,
+        characters_without_spaces: s.replace(/\s/g, "").length,
+        words: words.length,
+        syllables: words.reduce((n, w) => n + syllablesInWord(w), 0),
+      };
+    };
+    const lines = text.split(/\n/).filter(l => l.trim()).map(statLine);
+    const letters = {};
+    for (const ch of text.toLowerCase()) {
+      if (ch >= "a" && ch <= "z") letters[ch] = (letters[ch] || 0) + 1;
+    }
+    return JSON.stringify({
+      note: "Exact counts. Verify your draft against these numbers (especially per-line syllables) before sending. Syllables are an English estimate via vowel groups.",
+      overall: {
+        characters: text.length,
+        characters_without_spaces: text.replace(/\s/g, "").length,
+        words: wordsIn(text).length,
+        sentences: (text.match(/[.!?]+/g) || []).length || 1,
+        total_syllables: lines.reduce((n, l) => n + l.syllables, 0),
+      },
+      lines,
+      letter_frequency: letters,
+    });
+  }
+
+  /* ---------- web_search / read_webpage (Fix 3): live web access ----------
+     The browser cannot scrape other sites (CORS) and a search key must
+     never ship client-side, so both run through our Cloudflare Worker
+     (keyless sources — same pattern as the Groq proxy). */
+  async function toolWebSearch(args) {
+    const q = String((args && (args.query || args.q)) || "").trim();
+    if (!q) throw new Error("Missing query");
+    const res = await fetch(PROXY_URL + "/tools/search", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ q }),
+    });
+    if (!res.ok) {
+      let msg = "HTTP " + res.status;
+      try { msg = (await res.json()).error?.message || msg; } catch { /* ignore */ }
+      throw new Error("Web search failed: " + msg);
+    }
+    const j = await res.json();
+    return JSON.stringify(j);
+  }
+
+  async function toolReadWebpage(args) {
+    const url = String((args && args.url) || "").trim();
+    if (!/^https?:\/\//i.test(url)) throw new Error("Invalid URL (must start with http/https)");
+    const res = await fetch(PROXY_URL + "/tools/read", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ url }),
+    });
+    if (!res.ok) {
+      let msg = "HTTP " + res.status;
+      try { msg = (await res.json()).error?.message || msg; } catch { /* ignore */ }
+      throw new Error("Page read failed: " + msg);
+    }
+    const j = await res.json();
+    return JSON.stringify(j);
+  }
+
+  /* ---------- remember / forget (Fix 4a): long-term memory ----------
+     Small durable notes in localStorage, carried into every future
+     request by the UI (see memoryContext in app.js). */
+  const MEMORY_KEY = "bw_memory";
+  const MEMORY_CAP = 30;
+
+  function memoryFacts() {
+    try {
+      const arr = JSON.parse(localStorage.getItem(MEMORY_KEY) || "[]");
+      return Array.isArray(arr) ? arr.slice(-MEMORY_CAP) : [];
+    } catch { return []; }
+  }
+
+  function toolRemember(args) {
+    const fact = String((args && (args.fact || args.text)) || "").trim();
+    if (!fact) throw new Error("Missing fact");
+    if (fact.length > 300) throw new Error("Fact too long (max 300 characters)");
+    const arr = memoryFacts();
+    const key = fact.toLowerCase();
+    const i = arr.findIndex(f => String(f.fact || "").toLowerCase() === key);
+    if (i >= 0) arr.splice(i, 1); // re-storing a fact refreshes it
+    arr.push({ fact, ts: Date.now() });
+    try { localStorage.setItem(MEMORY_KEY, JSON.stringify(arr.slice(-MEMORY_CAP))); }
+    catch { throw new Error("Could not save memory (storage full or blocked)"); }
+    return JSON.stringify({ ok: true, stored: fact, total_facts: Math.min(arr.length, MEMORY_CAP) });
+  }
+
+  function toolForget(args) {
+    const q = String((args && (args.fact || args.query || args.text)) || "").trim().toLowerCase();
+    const before = memoryFacts();
+    const kept = q
+      ? before.filter(f => !String(f.fact || "").toLowerCase().includes(q))
+      : []; // no argument -> clear all memory
+    try { localStorage.setItem(MEMORY_KEY, JSON.stringify(kept)); }
+    catch { throw new Error("Could not update memory (storage blocked)"); }
+    return JSON.stringify({ ok: true, removed: before.length - kept.length, remaining: kept.length });
+  }
+
   const TOOL_DEFINITIONS = [
     {
       type: "function",
@@ -718,11 +885,86 @@
         },
       },
     },
+    {
+      type: "function",
+      function: {
+        name: "count_text",
+        description: "Exactly counts characters (with/without spaces), words, sentences, per-line syllables (English estimate) and letter frequencies of a text. ALWAYS call this on your draft before sending any answer with a count constraint: haiku (5-7-5), character limits, word limits, letter puzzles, acrostics. Pass the exact draft text, with each haiku line on its own line.",
+        parameters: {
+          type: "object",
+          properties: {
+            text: { type: "string", description: "The exact text to verify" },
+          },
+          required: ["text"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "web_search",
+        description: "Search the live web (current news, events, prices, latest versions, anything after your training data). Returns ~5 results with title, url and snippet. Call this FIRST whenever the user asks about anything recent or current, then cite the source URLs in your answer.",
+        parameters: {
+          type: "object",
+          properties: {
+            query: { type: "string", description: "Search query" },
+          },
+          required: ["query"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "read_webpage",
+        description: "Read the full text of a webpage by URL (use after web_search when a snippet is not enough). Returns plain text, capped at ~8000 characters.",
+        parameters: {
+          type: "object",
+          properties: {
+            url: { type: "string", description: "Full URL starting with http:// or https://" },
+          },
+          required: ["url"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "remember",
+        description: "Save an important, durable fact about the user (name, preferences, projects, goals, corrections about you) to long-term memory, so future chats remember it. Call when the user shares something worth remembering (\"my name is…\", \"I prefer…\", \"I'm working on…\") or asks you to remember something. Do NOT save trivial or short-lived chat details.",
+        parameters: {
+          type: "object",
+          properties: {
+            fact: { type: "string", description: "Short self-contained note in third person, e.g. 'User's name is Mano'" },
+          },
+          required: ["fact"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "forget",
+        description: "Delete facts from long-term memory. Call when the user asks you to forget something or corrects a stored fact. Pass matching text (substring match); call with no argument to clear ALL memory.",
+        parameters: {
+          type: "object",
+          properties: {
+            fact: { type: "string", description: "Text matching the fact(s) to delete; omit to clear all memory" },
+          },
+          required: [],
+        },
+      },
+    },
   ];
 
   const TOOL_EXECUTORS = {
     get_current_datetime: (args) => toolGetDatetime(args),
     get_weather: (args) => toolGetWeather(args),
+    count_text: (args) => toolCountText(args),
+    web_search: (args) => toolWebSearch(args),
+    read_webpage: (args) => toolReadWebpage(args),
+    remember: (args) => toolRemember(args),
+    forget: (args) => toolForget(args),
   };
 
   /* Passed by the UI into streamChat as cfg.tools. */
@@ -737,5 +979,5 @@
     };
   }
 
-  window.AI = { PROVIDERS, streamChat, testConnection, toolkit };
+  window.AI = { PROVIDERS, streamChat, testConnection, toolkit, memoryFacts };
 })();

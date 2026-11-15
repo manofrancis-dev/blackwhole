@@ -109,5 +109,205 @@ const req = (path, init = {}) => new Request("https://blackwhole-proxy.test" + p
   check("GET on proxy 405", res.status === 405);
 }
 
+/* ---- /tools/search (Fix 3) ---- */
+
+/* 9. search: parses DuckDuckGo Lite HTML into results */
+{
+  const ddgHtml = `
+  <html><body><table>
+  <tr><td>1.</td><td><a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fnews&amp;rut=abc">Example <b>News</b> Site</a></td></tr>
+  <tr><td class='result-snippet'>Latest &amp; greatest <b>story</b> — Nov 2026</td></tr>
+  <tr><td>2.</td><td><a rel="nofollow" href="https://second.org/page">Second Result</a></td></tr>
+  <tr><td class="result-snippet">Second snippet text</td></tr>
+  </table></body></html>`;
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("lite.duckduckgo.com")) {
+      return new Response(ddgHtml, { status: 200 });
+    }
+    return new Response("{}", { status: 200 });
+  };
+  const res = await worker.fetch(req("/tools/search", {
+    method: "POST",
+    headers: { origin: "https://manofrancis-dev.github.io", "content-type": "application/json" },
+    body: JSON.stringify({ q: "ai news" }),
+  }), env);
+  globalThis.fetch = origFetch;
+  const j = await res.json();
+  check("search 200", res.status === 200);
+  check("search CORS", res.headers.get("access-control-allow-origin") === "https://manofrancis-dev.github.io");
+  check("search source ddg", j.source === "duckduckgo");
+  check("search decodes redirect", j.results[0].url === "https://example.com/news", j.results[0].url);
+  check("search strips tags", j.results[0].title === "Example News Site", j.results[0].title);
+  check("search snippet decoded", j.results[0].snippet.includes("Latest & greatest story"), j.results[0].snippet);
+  check("search caps at 5", j.results.length <= 5);
+}
+
+/* 10. search: falls back to Wikipedia when DDG yields nothing */
+{
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("lite.duckduckgo.com")) {
+      return new Response("<html><body>no results here</body></html>", { status: 200 });
+    }
+    if (String(url).includes("wikipedia.org")) {
+      return new Response(JSON.stringify({
+        query: { search: [{ title: "Turing test", snippet: '<span class="searchmatch">AI</span> history' }] },
+      }), { status: 200 });
+    }
+    return new Response("{}", { status: 404 });
+  };
+  const res = await worker.fetch(req("/tools/search", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ q: "turing test" }),
+  }), env);
+  globalThis.fetch = origFetch;
+  const j = await res.json();
+  check("search fallback wikipedia", res.status === 200 && j.source === "wikipedia");
+  check("wikipedia url built", j.results[0].url === "https://en.wikipedia.org/wiki/Turing_test");
+  check("wikipedia snippet clean", j.results[0].snippet === "AI history", j.results[0].snippet);
+}
+
+/* 10b. search: Bing RSS fallback (used when DDG is blocked, e.g. from CF) */
+{
+  const rss = `<?xml version="1.0"?><rss version="2.0"><channel>
+  <item><title><![CDATA[First result & more]]></title><link>https://one.example/a</link><description><![CDATA[<b>Desc</b> one]]></description></item>
+  <item><title>Second result</title><link>https://two.example/b</link><description>Desc two</description></item>
+  <item><title>No link item</title><link>about:blank</link><description>skip</description></item>
+  </channel></rss>`;
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("lite.duckduckgo.com")) {
+      return new Response("<html><body>nothing</body></html>", { status: 200 });
+    }
+    if (String(url).includes("bing.com")) {
+      return new Response(rss, { status: 200 });
+    }
+    return new Response("{}", { status: 500 });
+  };
+  const res = await worker.fetch(req("/tools/search", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ q: "x" }),
+  }), env);
+  globalThis.fetch = origFetch;
+  const j = await res.json();
+  check("search fallback bing rss", res.status === 200 && j.source === "bing-rss");
+  check("bing rss parses cdata", j.results[0].title === "First result & more", j.results[0]);
+  check("bing rss strips html desc", j.results[0].snippet === "Desc one", j.results[0].snippet);
+  check("bing rss skips bad links", j.results.length === 2, j.results.length);
+}
+
+/* 11. search: bad input + total failure paths */
+{
+  const res = await worker.fetch(req("/tools/search", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({}),
+  }), env);
+  check("search missing q 400", res.status === 400);
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async () => { throw new Error("network down"); };
+  const res2 = await worker.fetch(req("/tools/search", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ q: "x" }),
+  }), env);
+  globalThis.fetch = origFetch;
+  check("search all sources down 502", res2.status === 502);
+}
+
+/* ---- /tools/read (Fix 3) ---- */
+
+/* 12. read: strips HTML to plain text and caps length */
+{
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    if (init && init.signal) {
+      // no real abort needed in the mock
+    }
+    return new Response(
+      "<html><head><style>body{color:red}</style><script>var x=1;</script></head>" +
+      "<body><h1>Hello &amp; welcome</h1><p>Paragraph one.</p>" + "<p>x</p>".repeat(5000) + "</body></html>",
+      { status: 200, headers: { "content-type": "text/html; charset=utf-8" } }
+    );
+  };
+  const res = await worker.fetch(req("/tools/read", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ url: "https://example.com/article" }),
+  }), env);
+  globalThis.fetch = origFetch;
+  const j = await res.json();
+  check("read 200", res.status === 200);
+  check("read strips html", j.text.startsWith("Hello & welcome Paragraph one."), j.text.slice(0, 60));
+  check("read no scripts", !j.text.includes("var x"));
+  check("read capped ~8000", j.text.length <= 8000 && j.truncated === true, j.text.length);
+}
+
+/* 13. read: guards (bad url, self-fetch, upstream error, timeout) */
+{
+  const res = await worker.fetch(req("/tools/read", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ url: "ftp://nope.example" }),
+  }), env);
+  check("read invalid url 400", res.status === 400);
+
+  const selfRes = await worker.fetch(req("/tools/read", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ url: "https://blackwhole-proxy.test/health" }),
+  }), env);
+  check("read self-fetch blocked", selfRes.status === 400);
+
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response("nope", { status: 404 });
+  const errRes = await worker.fetch(req("/tools/read", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ url: "https://example.com/gone" }),
+  }), env);
+  globalThis.fetch = origFetch;
+  check("read upstream 404 -> 502", errRes.status === 502);
+
+  globalThis.fetch = async () => { throw new Error("boom"); };
+  const failRes = await worker.fetch(req("/tools/read", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ url: "https://example.com/fail" }),
+  }), env);
+  globalThis.fetch = origFetch;
+  check("read fetch error 502", failRes.status === 502);
+}
+
+/* 14. read: plain-text (non-HTML) passthrough */
+{
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response("plain text body 1 < 2 > 3", { status: 200, headers: { "content-type": "text/plain" } });
+  const res = await worker.fetch(req("/tools/read", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ url: "https://example.com/data.txt" }),
+  }), env);
+  globalThis.fetch = origFetch;
+  const j = await res.json();
+  check("read plain text intact", j.text === "plain text body 1 < 2 > 3", j.text);
+}
+
+/* 15. tool routes work without the Groq secret configured */
+{
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response("<a rel=\"nofollow\" href=\"https://ok.example\">t</a>", { status: 200 });
+  const res = await worker.fetch(req("/tools/search", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ q: "x" }),
+  }), { ...env, GROQ_API_KEY: undefined });
+  globalThis.fetch = origFetch;
+  check("search needs no groq key", res.status === 200);
+}
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);
