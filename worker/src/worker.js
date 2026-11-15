@@ -115,17 +115,20 @@ async function searchMojeek(q) {
   });
   if (!res.ok) throw new Error("Mojeek HTTP " + res.status);
   const html = await res.text();
+  // Bot challenges render a "Captcha" page with stray links — only accept
+  // list items that look like real results (link + snippet paragraph).
   const results = [];
   for (const m of html.matchAll(/<li\b[^>]*>([\s\S]*?)<\/li>/gi)) {
     const block = m[1];
     const linkM = /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/i.exec(block);
     if (!linkM) continue;
+    const snipM = /<p\b[^>]*class=["'][^"']*\bs["'][^>]*>([\s\S]*?)<\/p>/i.exec(block);
+    if (!snipM) continue; // no snippet -> not a real result
     const url = linkM[1];
     if (!/^https?:\/\//i.test(url) || /mojeek\.com/i.test(url)) continue;
     const title = htmlToText(linkM[2]);
     if (!title) continue;
-    const snipM = /<p\b[^>]*class=["'][^"']*\bs["'][^>]*>([\s\S]*?)<\/p>/i.exec(block);
-    results.push({ title, url, snippet: snipM ? htmlToText(snipM[1]).slice(0, 300) : "" });
+    results.push({ title, url, snippet: htmlToText(snipM[1]).slice(0, 300) });
     if (results.length >= 5) break;
   }
   return results;
@@ -148,32 +151,21 @@ async function searchBrave(q, env) {
   }));
 }
 
-/* Keyless real-time news via GDELT (1 req / 5 s — one retry on 429). */
+/* Keyless real-time news via GDELT (max 1 req / 5 s — fail fast on 429). */
 async function searchGdelt(q) {
-  const call = async () => {
-    const u = "https://api.gdeltproject.org/api/v2/doc/doc?query=" +
-      encodeURIComponent(q) + "%20sourcelang:eng&mode=artlist&maxrecords=6&format=json&sort=datedesc";
-    const res = await fetch(u, { headers: { "user-agent": "BlackwholeProxy/1.0" } });
-    if (res.status === 429) throw Object.assign(new Error("GDELT rate limited"), { rate: true });
-    if (!res.ok) throw new Error("GDELT HTTP " + res.status);
-    const text = await res.text();
-    let j;
-    try { j = JSON.parse(text); } catch { throw new Error("GDELT bad response"); }
-    return (j.articles || []).map(a => ({
-      title: a.title,
-      url: a.url,
-      snippet: [a.domain, a.seendate].filter(Boolean).join(" • ").slice(0, 300),
-    })).filter(r => r.title && r.url);
-  };
-  try {
-    return await call();
-  } catch (e) {
-    if (e && e.rate) {
-      await new Promise(r => setTimeout(r, 5200)); // respect the 5 s limit once
-      return await call();
-    }
-    throw e;
-  }
+  const u = "https://api.gdeltproject.org/api/v2/doc/doc?query=" +
+    encodeURIComponent(q) + "%20sourcelang:eng&mode=artlist&maxrecords=6&format=json&sort=datedesc";
+  const res = await fetch(u, { headers: { "user-agent": "BlackwholeProxy/1.0" } });
+  if (res.status === 429) throw new Error("GDELT rate limited (1 req / 5 s)");
+  if (!res.ok) throw new Error("GDELT HTTP " + res.status);
+  const text = await res.text();
+  let j;
+  try { j = JSON.parse(text); } catch { throw new Error("GDELT bad response"); }
+  return (j.articles || []).map(a => ({
+    title: a.title,
+    url: a.url,
+    snippet: [a.domain, a.seendate].filter(Boolean).join(" • ").slice(0, 300),
+  })).filter(r => r.title && r.url);
 }
 
 /* Keyless tech-news via the Hacker News (Algolia) API. */
@@ -266,23 +258,42 @@ export default {
       const debug = url.searchParams.get("debug") === "1";
       const errors = debug ? {} : null;
       let results = [], source = "";
-      const trySource = async (name, fn) => {
-        try {
-          const r = await fn();
-          if (r.length) { source = name; results = r; return true; }
-        } catch (e) {
-          if (errors) errors[name] = String((e && e.message) || e);
+
+      /* Fire keyless sources in parallel and pick by priority, in two
+         tiers so cold-start latency stays ~2-4 s: Tier B (general engines
+         — best quality when reachable, but they hang/challenge Cloudflare
+         IPs) gets a short window; then Tier A (always reachable from CF)
+         is awaited by priority. A sequential chain once took 34 s. */
+      const pickFrom = async (jobs) => {
+        for (const [name, p] of jobs) {
+          try {
+            const r = await p;
+            if (r.length) { source = name; results = r; return true; }
+          } catch (e) {
+            if (errors) errors[name] = String((e && e.message) || e);
+          }
         }
         return false;
       };
-      if (await trySource("brave", () => searchBrave(q, env)) ||
-          await trySource("duckduckgo", () => searchDuckDuckGo(q)) ||
-          await trySource("mojeek", () => searchMojeek(q)) ||
-          await trySource("google-news", () => searchGoogleNewsRss(q)) ||
-          await trySource("gdelt", () => searchGdelt(q)) ||
-          await trySource("hn", () => searchHackerNews(q)) ||
-          await trySource("wikipedia", () => searchWikipedia(q)) ||
-          await trySource("bing-rss", () => searchBingRss(q))) { /* got results */ }
+      const shortWait = (p) => Promise.race([
+        p, new Promise((_, rej) => setTimeout(() => rej(new Error("tier-b window elapsed")), 1600)),
+      ]);
+      const longWait = (p, name) => Promise.race([
+        p, new Promise((_, rej) => setTimeout(() => rej(new Error(name + " timed out")), 6000)),
+      ]);
+      const tierB = [
+        ["duckduckgo", shortWait(searchDuckDuckGo(q))],
+        ["mojeek", shortWait(searchMojeek(q))],
+        ["google-news", shortWait(searchGoogleNewsRss(q))],
+      ];
+      const tierA = [
+        ...(env.BRAVE_API_KEY ? [["brave", longWait(searchBrave(q, env), "brave")]] : []),
+        ["gdelt", longWait(searchGdelt(q), "gdelt")],
+        ["hn", longWait(searchHackerNews(q), "hn")],
+        ["wikipedia", longWait(searchWikipedia(q), "wikipedia")],
+        ["bing-rss", longWait(searchBingRss(q), "bing-rss")],
+      ];
+      const found = await pickFrom(tierB) || await pickFrom(tierA);
       if (!results.length) {
         return json({ error: { message: "No results found — search sources are unavailable right now." }, errors }, 502, cors);
       }

@@ -5,6 +5,15 @@ small work items. Everything fits the existing architecture: prompt rules in
 `js/api.js`, ChatGPT-style tools via `AI.toolkit()`, and server-side helpers in
 the Cloudflare Worker (`worker/src/worker.js`).
 
+> **Status (Nov 15 2026): all four fixes shipped, tested and verified live.**
+> Fix 1 ✅ live · Fix 2 ✅ live (haiku verified 5-7-5 via tool) ·
+> Fix 3 ✅ live (real Nov-2026 news with links; see worker/README.md for the
+> search-source saga — DDG/Google-News/Mojeek all bot-challenge CF IPs, so the
+> worker races keyless sources in parallel) · Fix 4a ✅ live (name remembered
+> across chats) · Fix 4b ✅ unit-tested (mechanical rolling summary, no extra
+> API call). Upgrade path for best search quality: set a `BRAVE_API_KEY`
+> worker secret.
+
 Legend: 🟢 prompt-only · 🟡 frontend tool · 🔴 worker change
 
 ---
