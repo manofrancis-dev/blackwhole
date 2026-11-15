@@ -18,7 +18,7 @@
     apiKey: "",
     model: "openai/gpt-oss-120b",
     baseUrl: "",
-    systemPrompt: "You are Blackwhole, a helpful, friendly AI assistant created by Mano Francis. Answer clearly and concisely, using markdown formatting when useful.",
+    systemPrompt: "You are Blackwhole, a helpful, friendly AI assistant created by Mano Francis. Answer clearly and concisely, using markdown formatting when useful. Never invent the current date, time, or weather — always rely on the provided real-time context and tools instead.",
     temperature: 0.7,
   };
   let chats = [];               // [{id, title, createdAt, messages:[{role,content}]}]
@@ -687,6 +687,33 @@
     runAssistant(conv);
   }
 
+  /* Fresh, accurate real-time facts injected into every request, so the
+     model never guesses the date, time or timezone (it cannot know them —
+     its training data is months old). Built at send time. */
+  function realtimeContext() {
+    const now = new Date();
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || "unknown";
+    let local;
+    try {
+      local = new Intl.DateTimeFormat("en-GB", {
+        weekday: "long", day: "numeric", month: "long", year: "numeric",
+        hour: "numeric", minute: "2-digit", hour12: true, timeZoneName: "short",
+      }).format(now);
+    } catch { local = now.toString(); }
+    const off = -now.getTimezoneOffset();
+    const oh = String(Math.floor(Math.abs(off) / 60)).padStart(2, "0");
+    const om = String(Math.abs(off) % 60).padStart(2, "0");
+    return [
+      "REAL-TIME CONTEXT (captured just now — trust this over your training data):",
+      "- User's local date & time: " + local + " (" + tz + ", UTC" +
+        (off >= 0 ? "+" : "-") + oh + ":" + om + ")",
+      "- UTC now: " + now.toUTCString(),
+      "- Rule: never guess or invent the current date, time or weather. For",
+      "  time questions use the context above (or the get_current_datetime",
+      "  tool for other cities); for weather always call the get_weather tool.",
+    ].join("\n");
+  }
+
   async function runAssistant(conv) {
     streaming = true;
     abortCtrl = new AbortController();
@@ -706,23 +733,34 @@
     };
 
     try {
-      full = await AI.streamChat(settings, conv.messages, {
-        onDelta: (_delta, all) => { partial = all; paint(all); },
-        onRetry: (sec) => {
-          shell._md.innerHTML =
-            '<p class="retry-note">⏳ Free-tier limit hit — retrying in <b>' + sec + 's</b>…</p>';
-          autoScroll();
-        },
-        onContinue: () => {
-          shell._md.innerHTML =
-            '<p class="retry-note">⏳ Continuing the answer…</p>';
-          autoScroll();
-        },
-        onTruncated: () => {
-          toast('Reply may be incomplete — send "continue" to keep going.');
-        },
-        signal: abortCtrl.signal,
-      });
+      full = await AI.streamChat(
+        { ...settings, clientContext: realtimeContext(), tools: AI.toolkit() },
+        conv.messages,
+        {
+          onDelta: (_delta, all) => { partial = all; paint(all); },
+          onRetry: (sec) => {
+            shell._md.innerHTML =
+              '<p class="retry-note">⏳ Free-tier limit hit — retrying in <b>' + sec + 's</b>…</p>';
+            autoScroll();
+          },
+          onContinue: () => {
+            shell._md.innerHTML =
+              '<p class="retry-note">⏳ Continuing the answer…</p>';
+            autoScroll();
+          },
+          onToolCall: (name) => {
+            const label = name === "get_weather" ? "🌦️ Checking live weather…"
+              : name === "get_current_datetime" ? "🕒 Checking the exact time…"
+              : "🛠️ Using a tool…";
+            shell._md.innerHTML = '<p class="retry-note">' + label + "</p>";
+            autoScroll();
+          },
+          onTruncated: () => {
+            toast('Reply may be incomplete — send "continue" to keep going.');
+          },
+          signal: abortCtrl.signal,
+        }
+      );
       conv.messages.push({ role: "assistant", content: full });
       saveChats();
     } catch (err) {

@@ -79,7 +79,9 @@
     const p = PROVIDERS[cfg.provider] || PROVIDERS.openai;
     const base = (cfg.baseUrl || p.baseUrl).replace(/\/+$/, "");
     const model = cfg.model || p.defaultModel;
-    const system = [IDENTITY_PROMPT, cfg.systemPrompt].filter(Boolean).join("\n\n");
+    /* clientContext carries fresh real-time facts (date/time/timezone) built
+       by the UI on every send, so the model never guesses them. */
+    const system = [IDENTITY_PROMPT, cfg.systemPrompt, cfg.clientContext].filter(Boolean).join("\n\n");
 
     if (p.style === "anthropic") {
       const body = {
@@ -105,7 +107,16 @@
     }
 
     // OpenAI-compatible
-    const msgs = messages.map(m => ({ role: m.role, content: m.content }));
+    // Preserve tool-calling fields — the model needs the assistant's
+    // tool_calls and each tool result's tool_call_id to stay paired.
+    const msgs = messages.map(m => {
+      const out = { role: m.role, content: m.content ?? "" };
+      if (m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length) {
+        out.tool_calls = m.tool_calls;
+      }
+      if (m.role === "tool" && m.tool_call_id) out.tool_call_id = m.tool_call_id;
+      return out;
+    });
     if (system) msgs.unshift({ role: "system", content: system });
 
     // Groq's free tier has a tight tokens-per-minute budget. Keep each request
@@ -128,6 +139,15 @@
       messages: msgs,
     };
     if (isGroq && /gpt-oss/i.test(model)) body.reasoning_effort = "low";
+
+    // Function calling ("tools"), ChatGPT-style: the model can ask the browser
+    // for live data (weather, exact date/time) mid-answer. Skipped for the
+    // "custom" provider because unknown endpoints may reject the field.
+    if (cfg.tools && Array.isArray(cfg.tools.definitions) && cfg.tools.definitions.length &&
+        cfg.provider !== "custom") {
+      body.tools = cfg.tools.definitions;
+      body.tool_choice = "auto";
+    }
 
     const headers = { "content-type": "application/json" };
     // noKey providers (the blackwhole proxy) inject the key server-side —
@@ -222,7 +242,9 @@
   }
 
   /* Keep only the most recent messages that fit within a token budget,
-     so long chats stay under per-minute (TPM) rate limits. */
+     so long chats stay under per-minute (TPM) rate limits. Tool-result
+     messages whose assistant call was trimmed away are dropped too, because
+     a "tool" message without its preceding tool_calls makes the API 400. */
   function trimHistory(messages, budget) {
     const kept = [];
     let total = 0;
@@ -232,7 +254,13 @@
       kept.unshift(messages[i]);
       total += t;
     }
-    return kept;
+    const hasCall = new Set();
+    for (const m of kept) {
+      if (m.role === "assistant" && Array.isArray(m.tool_calls)) {
+        for (const c of m.tool_calls) if (c.id) hasCall.add(c.id);
+      }
+    }
+    return kept.filter(m => m.role !== "tool" || hasCall.has(m.tool_call_id));
   }
 
   async function attempt(cfg, messages, { onDelta, signal } = {}) {
@@ -261,6 +289,8 @@
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "", full = "", finishReason = null, providerError = null;
+    // Tool calls arrive streamed, split across chunks: accumulate by index.
+    const toolAcc = {};
 
     const handleEvent = (ev) => {
       for (const line of ev.split("\n")) {
@@ -279,13 +309,26 @@
           continue;
         }
 
+        const choice = json.choices && json.choices[0];
         const delta = extractDelta(p.style, json);
         if (delta) {
           full += delta;
           if (onDelta) onDelta(delta, full);
         }
-        const fr = json.choices && json.choices[0] && json.choices[0].finish_reason;
-        if (fr) finishReason = fr;
+        // Accumulate streamed tool_call fragments (OpenAI-compatible shape).
+        const dToolCalls = choice && choice.delta && choice.delta.tool_calls;
+        if (Array.isArray(dToolCalls)) {
+          for (const tc of dToolCalls) {
+            const i = tc.index || 0;
+            if (!toolAcc[i]) toolAcc[i] = { id: "", name: "", arguments: "" };
+            if (tc.id) toolAcc[i].id = tc.id;
+            if (tc.function && tc.function.name) toolAcc[i].name = tc.function.name;
+            if (tc.function && typeof tc.function.arguments === "string") {
+              toolAcc[i].arguments += tc.function.arguments;
+            }
+          }
+        }
+        if (choice && choice.finish_reason) finishReason = choice.finish_reason;
       }
     };
 
@@ -317,9 +360,12 @@
 
     if (!full.trim()) {
       if (providerError) throw providerError;
+      const calls = Object.values(toolAcc).filter(t => t.name);
+      if (calls.length) return { text: "", finishReason, incomplete: false, toolCalls: calls };
       throw new Error("Empty response from provider. Check the model name in Settings.");
     }
-    return { text: full, finishReason, incomplete: false };
+    const calls = Object.values(toolAcc).filter(t => t.name);
+    return { text: full, finishReason, incomplete: false, toolCalls: calls };
   }
 
   /* Abort-aware delay used between rate-limit retries. */
@@ -351,9 +397,11 @@
    * If the model stops because it hit the token cap (finish_reason=length) or
    * the connection drops mid-answer, the answer is continued automatically so
    * the user never gets a half-finished reply.
-   * @param {object} cfg  {provider, apiKey, baseUrl, model, systemPrompt, temperature}
+   * @param {object} cfg  {provider, apiKey, baseUrl, model, systemPrompt, temperature,
+   *                      clientContext, tools: {definitions, execute(name, args)}}
    * @param {Array}  messages  [{role:'user'|'assistant', content}]
-   * @param {object} handlers  {onDelta(text, full), onRetry(seconds, attempt), onContinue(n), onTruncated(), signal}
+   * @param {object} handlers  {onDelta(text, full), onRetry(seconds, attempt), onContinue(n),
+   *                            onToolCall(name), onTruncated(), signal}
    * @returns {Promise<string>} full assistant text
    */
   async function streamChat(cfg, messages, handlers = {}) {
@@ -369,7 +417,7 @@
       throw new Error("Custom provider needs a Base URL in Settings.");
     }
 
-    const isGroq = cfg.provider === "groq";
+    const isGroq = cfg.provider === "groq" || cfg.provider === "blackwhole";
     // Groq free tier = ~8,000 tokens/minute. Keep the whole request small.
     let budget = isGroq ? 1800 : 24000;
     let msgs = messages;
@@ -377,8 +425,11 @@
     let shrinks = 0;
     let retries = 0;
     let continuations = 0;
+    let toolRounds = 0;
+    let toolsDisabled = false;
     const MAX_RETRIES = 6;
     const MAX_CONTINUATIONS = 4;
+    const MAX_TOOL_ROUNDS = 3;
 
     while (true) {
       try {
@@ -389,6 +440,43 @@
           },
         });
         answer += res.text;
+
+        // The model asked for a tool (live weather, exact date/time…): run it
+        // in the browser, feed the result back, and let it answer with real
+        // data — the same loop ChatGPT uses for its built-in tools.
+        if (res.toolCalls && res.toolCalls.length && cfg.tools && cfg.tools.execute &&
+            toolRounds < MAX_TOOL_ROUNDS) {
+          toolRounds++;
+          const executed = [];
+          for (const call of res.toolCalls) {
+            if (handlers.onToolCall) handlers.onToolCall(call.name);
+            let result;
+            try {
+              const args = call.arguments ? JSON.parse(call.arguments) : {};
+              result = await cfg.tools.execute(call.name, args);
+            } catch (e) {
+              result = "Tool error: " + ((e && e.message) || "failed");
+            }
+            executed.push({
+              id: call.id || ("call_" + toolRounds + "_" + executed.length),
+              name: call.name,
+              arguments: call.arguments || "{}",
+              result: String(result),
+            });
+          }
+          msgs = msgs.concat([
+            {
+              role: "assistant",
+              content: res.text || "",
+              tool_calls: executed.map(c => ({
+                id: c.id, type: "function",
+                function: { name: c.name, arguments: c.arguments },
+              })),
+            },
+            ...executed.map(c => ({ role: "tool", tool_call_id: c.id, content: c.result })),
+          ]);
+          continue; // next round streams the final, data-backed answer
+        }
 
         // The model ran out of output tokens or the stream was cut off:
         // ask it to carry on, seamlessly, from the last character it wrote.
@@ -424,8 +512,21 @@
           shrinks++;
           budget = Math.max(600, Math.floor(budget / 2));
           if (shrinks >= 2) {
-            msgs = msgs.map(m => ({ role: m.role, content: String(m.content || "").slice(-3000) }));
+            // Also drop transient tool exchanges — their JSON payload is the
+            // usual culprit, and keeping half a tool pair breaks the API.
+            msgs = msgs
+              .filter(m => m.role === "user" || (m.role === "assistant" && !m.tool_calls))
+              .map(m => ({ role: m.role, content: String(m.content || "").slice(-3000) }));
           }
+          continue;
+        }
+
+        // The endpoint rejected the request — likely it doesn't support
+        // tools/function-calling. Retry once without them before giving up.
+        if (err && err.status === 400 && cfg.tools && !toolsDisabled) {
+          toolsDisabled = true;
+          cfg = { ...cfg, tools: null };
+          msgs = msgs.filter(m => m.role !== "tool" && !(m.role === "assistant" && m.tool_calls));
           continue;
         }
 
@@ -469,5 +570,147 @@
     }
   }
 
-  window.AI = { PROVIDERS, streamChat, testConnection };
+  /* ---------- Built-in tools (ChatGPT-style function calling) ----------
+     The model calls these mid-answer whenever it needs live data it cannot
+     know from training: current date/time (any timezone) and real weather.
+     Weather uses Open-Meteo — free, keyless, CORS-enabled. */
+  const WMO_CODES = {
+    0: "Clear sky", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
+    45: "Fog", 48: "Depositing rime fog",
+    51: "Light drizzle", 53: "Moderate drizzle", 55: "Dense drizzle",
+    56: "Light freezing drizzle", 57: "Dense freezing drizzle",
+    61: "Slight rain", 63: "Moderate rain", 65: "Heavy rain",
+    66: "Light freezing rain", 67: "Heavy freezing rain",
+    71: "Slight snowfall", 73: "Moderate snowfall", 75: "Heavy snowfall",
+    77: "Snow grains",
+    80: "Slight rain showers", 81: "Moderate rain showers", 82: "Violent rain showers",
+    85: "Slight snow showers", 86: "Heavy snow showers",
+    95: "Thunderstorm", 96: "Thunderstorm with slight hail", 99: "Thunderstorm with heavy hail",
+  };
+
+  function toolGetDatetime(args) {
+    const now = new Date();
+    let tz = (args && typeof args.timezone === "string" && args.timezone.trim()) ||
+             Intl.DateTimeFormat().resolvedOptions().timeZone;
+    let local;
+    try {
+      local = new Intl.DateTimeFormat("en-GB", {
+        timeZone: tz, weekday: "long", day: "numeric", month: "long",
+        year: "numeric", hour: "numeric", minute: "2-digit", second: "2-digit",
+        hour12: true, timeZoneName: "short",
+      }).format(now);
+    } catch {
+      tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      local = now.toString();
+    }
+    return JSON.stringify({
+      utc: now.toUTCString(),
+      iso_utc: now.toISOString(),
+      timezone: tz,
+      local_time: local,
+    });
+  }
+
+  async function toolGetWeather(args) {
+    const q = String((args && (args.location || args.city || args.place)) || "").trim();
+    if (!q) throw new Error("Missing location");
+    const geoUrl = "https://geocoding-api.open-meteo.com/v1/search?name=" +
+      encodeURIComponent(q) + "&count=1&language=en&format=json";
+    const geoRes = await fetch(geoUrl);
+    if (!geoRes.ok) throw new Error("Geocoding failed (HTTP " + geoRes.status + ")");
+    const geo = await geoRes.json();
+    const g = geo.results && geo.results[0];
+    if (!g) throw new Error('Place not found: "' + q + '"');
+
+    const url = "https://api.open-meteo.com/v1/forecast?latitude=" + g.latitude +
+      "&longitude=" + g.longitude +
+      "&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation," +
+      "weather_code,cloud_cover,wind_speed_10m,wind_direction_10m" +
+      "&daily=temperature_2m_max,temperature_2m_min,weather_code,precipitation_probability_max,sunrise,sunset" +
+      "&timezone=auto&forecast_days=2";
+    const res = await fetch(url);
+    if (!res.ok) throw new Error("Weather lookup failed (HTTP " + res.status + ")");
+    const j = await res.json();
+    const c = j.current || {};
+    const d = j.daily || {};
+    return JSON.stringify({
+      place: [g.name, g.admin1, g.country].filter(Boolean).join(", "),
+      local_time: c.time,
+      timezone: j.timezone,
+      now: {
+        temperature_c: c.temperature_2m,
+        feels_like_c: c.apparent_temperature,
+        condition: WMO_CODES[c.weather_code] || "Unknown",
+        humidity_percent: c.relative_humidity_2m,
+        precipitation_mm: c.precipitation,
+        cloud_percent: c.cloud_cover,
+        wind_kmh: c.wind_speed_10m,
+        wind_direction_deg: c.wind_direction_10m,
+      },
+      today: {
+        max_c: d.temperature_2m_max ? d.temperature_2m_max[0] : null,
+        min_c: d.temperature_2m_min ? d.temperature_2m_min[0] : null,
+        condition: d.weather_code ? (WMO_CODES[d.weather_code[0]] || null) : null,
+        rain_chance_percent: d.precipitation_probability_max ? d.precipitation_probability_max[0] : null,
+        sunrise: d.sunrise ? d.sunrise[0] : null,
+        sunset: d.sunset ? d.sunset[0] : null,
+      },
+      tomorrow: {
+        max_c: d.temperature_2m_max ? d.temperature_2m_max[1] : null,
+        min_c: d.temperature_2m_min ? d.temperature_2m_min[1] : null,
+        condition: d.weather_code ? (WMO_CODES[d.weather_code[1]] || null) : null,
+        rain_chance_percent: d.precipitation_probability_max ? d.precipitation_probability_max[1] : null,
+      },
+    });
+  }
+
+  const TOOL_DEFINITIONS = [
+    {
+      type: "function",
+      function: {
+        name: "get_current_datetime",
+        description: "Get the accurate current date and time. Use for any question about the time or date, including other cities or timezones (pass their IANA timezone, e.g. Asia/Kolkata, America/New_York).",
+        parameters: {
+          type: "object",
+          properties: {
+            timezone: { type: "string", description: "Optional IANA timezone name, e.g. Europe/Paris" },
+          },
+          required: [],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "get_weather",
+        description: "Get live weather right now plus today's and tomorrow's forecast for a city or place. Use for any weather question.",
+        parameters: {
+          type: "object",
+          properties: {
+            location: { type: "string", description: "City or place name, e.g. Chennai" },
+          },
+          required: ["location"],
+        },
+      },
+    },
+  ];
+
+  const TOOL_EXECUTORS = {
+    get_current_datetime: (args) => toolGetDatetime(args),
+    get_weather: (args) => toolGetWeather(args),
+  };
+
+  /* Passed by the UI into streamChat as cfg.tools. */
+  function toolkit() {
+    return {
+      definitions: TOOL_DEFINITIONS,
+      execute: async (name, args) => {
+        const fn = TOOL_EXECUTORS[name];
+        if (!fn) return "Unknown tool: " + name;
+        return await fn(args || {});
+      },
+    };
+  }
+
+  window.AI = { PROVIDERS, streamChat, testConnection, toolkit };
 })();
