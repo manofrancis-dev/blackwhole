@@ -69,6 +69,31 @@
     "Never say you are ChatGPT, GPT, Claude, Llama, or that you were made by OpenAI, " +
     "Groq, Meta, or any other company. Always answer as Blackwhole, created by Mano Francis.";
 
+  /* Accuracy rules baked into every request, right after the identity.
+     These target the failure modes observed in QA reviews: superseded
+     world facts presented as current, invented quotes/citations, and
+     form-constrained writing (haiku, letter puzzles) shipped without
+     self-verifying the constraint. */
+  const ACCURACY_PROMPT =
+    "ACCURACY RULES — follow these always.\n" +
+    "1. Never fabricate quotes, letters, dialogues, report cards, or citations. " +
+    "Quote word-for-word ONLY what you are confident is authentic and verifiable; " +
+    "otherwise paraphrase and say it is paraphrased. Never cite a source you are " +
+    "not sure exists.\n" +
+    "2. Fast-changing facts (currencies, capital-city names, country names, " +
+    "officeholders, population/health statistics) go stale. Use the most recent " +
+    "value you know with confidence and state the year. Never present a superseded " +
+    "value as current — e.g. Croatia uses the euro (adopted 1 Jan 2023, kuna retired); " +
+    "Kazakhstan's capital is Astana again (renamed back in 2022). If unsure of the " +
+    "latest value, say so and give the last value you are sure of, with its year.\n" +
+    "3. For form-constrained writing (haiku, rhymes, acrostics, letter-avoidance, " +
+    "fixed counts), verify EVERY line against the constraint before finishing. " +
+    "Explicitly count syllables, letters, or sentences; a haiku is exactly 5-7-5. " +
+    "If a line violates the constraint, silently rewrite it — never ship a line " +
+    "that breaks the requested form.\n" +
+    "4. Do not invent people, events, numbers, or details to fill gaps. Saying " +
+    "\"I'm not certain\" is always better than a plausible-sounding guess.";
+
   /* Sent when a reply hits the token cap or a stream drops mid-answer. */
   const CONTINUE_PROMPT =
     "Continue the previous answer from exactly where it stopped. " +
@@ -81,7 +106,7 @@
     const model = cfg.model || p.defaultModel;
     /* clientContext carries fresh real-time facts (date/time/timezone) built
        by the UI on every send, so the model never guesses them. */
-    const system = [IDENTITY_PROMPT, cfg.systemPrompt, cfg.clientContext].filter(Boolean).join("\n\n");
+    const system = [IDENTITY_PROMPT, ACCURACY_PROMPT, cfg.systemPrompt, cfg.clientContext].filter(Boolean).join("\n\n");
 
     if (p.style === "anthropic") {
       const body = {
