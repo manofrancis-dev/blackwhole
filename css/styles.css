@@ -757,7 +757,27 @@ html[data-theme="dark"] .user-bubble {
   animation: retry-pulse 1.4s ease-in-out infinite;
 }
 .retry-note b { color: var(--accent); }
+.retry-note .retry-attempt { color: var(--text-dim); opacity: .8; font-size: .85em; }
 @keyframes retry-pulse { 0%,100% { opacity: .55; } 50% { opacity: 1; } }
+
+/* One-tap recovery shown when automatic retries are exhausted. */
+.retry-btn {
+  margin-top: 8px;
+  padding: 7px 14px;
+  font: 600 .86rem/1 var(--font-sans);
+  color: var(--text);
+  background: var(--accent-soft);
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: background .15s ease, border-color .15s ease, transform .1s ease;
+}
+.retry-btn:hover {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.retry-btn:active { transform: scale(.97); }
 
 .md.streaming-cursor > *:last-child::after {
   content: "▍";

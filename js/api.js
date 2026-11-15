@@ -268,6 +268,17 @@
       throw e;
     }
 
+    // Server-side hiccup (our proxy or the provider briefly overloaded or
+    // restarting) — automatically retried with backoff by streamChat, so a
+    // transient 5xx never reaches the visitor as a dead end.
+    if (res.status === 408 || res.status >= 500) {
+      const e = new Error("Blackwhole's AI service is briefly busy. Retrying automatically…");
+      e.status = res.status;
+      e.retryable = true;
+      e.retryAfter = parseRetryAfter(res, detail);
+      throw e;
+    }
+
     fail("Provider error (HTTP " + res.status + "). " + detail);
   }
 
@@ -332,10 +343,15 @@
       });
     } catch (err) {
       if (err && err.name === "AbortError") throw err;
+      // Transient network failure (connection reset, DNS hiccup, our proxy
+      // briefly unreachable). Always retried with backoff by streamChat so
+      // a momentary blip never surfaces to the visitor as an error.
       if (p.noKey) {
-        // Our proxy is down or unreachable — not something the visitor caused.
-        throw new Error("Blackwhole's free AI service is unreachable right now. Please try again shortly.");
+        const e = new Error("Blackwhole's free AI service is unreachable right now. Please try again shortly.");
+        e.retryable = true;
+        throw e;
       }
+      err.retryable = true;
       throw err;
     }
 
@@ -456,8 +472,9 @@
    * @param {object} cfg  {provider, apiKey, baseUrl, model, systemPrompt, temperature,
    *                      clientContext, tools: {definitions, execute(name, args)}}
    * @param {Array}  messages  [{role:'user'|'assistant', content}]
-   * @param {object} handlers  {onDelta(text, full), onRetry(seconds, attempt), onContinue(n),
+   * @param {object} handlers  {onDelta(text, full), onRetry(seconds, attempt, reason), onContinue(n),
    *                            onToolCall(name), onTruncated(), signal}
+   *                            reason: "rate" | "reconnect" | "server"
    * @returns {Promise<string>} full assistant text
    */
   async function streamChat(cfg, messages, handlers = {}) {
@@ -480,12 +497,22 @@
     let answer = "";
     let shrinks = 0;
     let retries = 0;
+    let netRetries = 0;
+    let serverRetries = 0;
     let continuations = 0;
     let toolRounds = 0;
     let toolsDisabled = false;
     const MAX_RETRIES = 6;
+    const MAX_NET_RETRIES = 5;
+    const MAX_SERVER_RETRIES = 3;
     const MAX_CONTINUATIONS = 4;
     const MAX_TOOL_ROUNDS = 3;
+
+    /* Exponential backoff with jitter for transient failures:
+       ~1s, 2s, 4s, 8s, 16s — capped so retries stay responsive. */
+    function backoffSec(n) {
+      return Math.min(20, Math.pow(2, n - 1)) + Math.random();
+    }
 
     while (true) {
       try {
@@ -600,9 +627,30 @@
         if (err && err.status === 429 && retries < MAX_RETRIES) {
           retries++;
           const waitSec = Math.min(Math.ceil(err.retryAfter || 20), 90);
-          if (handlers.onRetry) handlers.onRetry(waitSec, retries);
+          if (handlers.onRetry) handlers.onRetry(waitSec, retries, "rate");
           await delay(waitSec * 1000, handlers.signal);
           budget = Math.max(1000, Math.floor(budget * 0.8));
+          continue;
+        }
+
+        // Transient network hiccup (connection reset, DNS blip, our proxy
+        // briefly unreachable): back off and retry automatically, so a
+        // momentary outage never surfaces as an error for the visitor.
+        if (err && err.retryable && !err.status && netRetries < MAX_NET_RETRIES) {
+          netRetries++;
+          const waitSec = backoffSec(netRetries);
+          if (handlers.onRetry) handlers.onRetry(waitSec, netRetries, "reconnect");
+          await delay(waitSec * 1000, handlers.signal);
+          continue;
+        }
+
+        // The provider/proxy returned 5xx or timed out: same automatic
+        // retry treatment, honouring any Retry-After hint.
+        if (err && err.retryable && err.status && serverRetries < MAX_SERVER_RETRIES) {
+          serverRetries++;
+          const waitSec = Math.min(Math.ceil(err.retryAfter || backoffSec(serverRetries)), 90);
+          if (handlers.onRetry) handlers.onRetry(waitSec, serverRetries, "server");
+          await delay(waitSec * 1000, handlers.signal);
           continue;
         }
 

@@ -234,9 +234,30 @@ const json = (data, status, extra = {}) =>
     headers: { "content-type": "application/json", ...extra },
   });
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 export default {
   async fetch(request, env) {
-    const cors = corsHeaders(request, env);
+    /* Last-resort safety net: an uncaught throw here would make Cloudflare
+       return a bare HTML crash page WITHOUT CORS headers — the browser then
+       hides the real error and the client sees a network failure instead
+       ("service unreachable"). Always answer with CORS-enabled JSON so the
+       frontend can read the cause, classify it, and auto-retry. */
+    try {
+      return await handle(request, env);
+    } catch (e) {
+      const cors = corsHeaders(request, env);
+      return json(
+        { error: { message: "Proxy error: " + ((e && e.message) || "unknown") } },
+        500,
+        { ...cors, "retry-after": "2" }
+      );
+    }
+  },
+};
+
+async function handle(request, env) {
+  const cors = corsHeaders(request, env);
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
 
     const url = new URL(request.url);
@@ -353,24 +374,84 @@ export default {
     const path = url.pathname.replace(/^\/v1\/?/, "");
     if (!path) return json({ error: { message: "Unknown path." } }, 404, cors);
 
-    const upstream = await fetch(GROQ_BASE + "/" + path, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "authorization": "Bearer " + env.GROQ_API_KEY,
-      },
-      body: await request.text(),
-    });
+    /* Transient upstream failures (connection resets, Groq 5xx/429) are
+       retried HERE with a short backoff, before anything streams, so a
+       momentary hiccup never reaches the visitor as an error. Non-retryable
+       client errors (400/401/403/413/422…) pass through untouched so the
+       frontend's own handling keeps working. */
+    const body = await request.text();
+    const ATTEMPTS = 3;
+    let lastUpstream = null; // last retryable response (for pass-through on exhaust)
+    let lastConnError = null; // last connection-level failure
+    for (let i = 0; i < ATTEMPTS; i++) {
+      let upstream;
+      try {
+        upstream = await fetch(GROQ_BASE + "/" + path, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "authorization": "Bearer " + env.GROQ_API_KEY,
+          },
+          body,
+        });
+      } catch (e) {
+        // Connection-level failure (DNS, TLS, reset) -> back off and retry.
+        lastConnError = e;
+        await sleep(400 * (i + 1));
+        continue;
+      }
 
-    // Pass everything through — including errors — so the client's own
-    // handling (401 / 413 / 429 + Retry-After auto-retry) keeps working.
-    // SSE bodies stream straight to the browser.
-    const headers = new Headers(cors);
-    const ct = upstream.headers.get("content-type");
-    if (ct) headers.set("content-type", ct);
-    const ra = upstream.headers.get("retry-after");
-    if (ra) headers.set("retry-after", ra);
+      if (upstream.ok) {
+        // Success: pass everything through — SSE bodies stream straight to
+        // the browser (mid-stream drops are healed by the client's
+        // partial-answer + automatic-continue logic).
+        const headers = new Headers(cors);
+        const ct = upstream.headers.get("content-type");
+        if (ct) headers.set("content-type", ct);
+        const ra = upstream.headers.get("retry-after");
+        if (ra) headers.set("retry-after", ra);
+        return new Response(upstream.body, { status: upstream.status, headers });
+      }
 
-    return new Response(upstream.body, { status: upstream.status, headers });
-  },
-};
+      if (upstream.status >= 500 || upstream.status === 429) {
+        // Retryable upstream state. Capture the small error body now (it
+        // cannot be re-read later), then back off — honouring Groq's
+        // Retry-After on 429, capped so the browser never times out.
+        const errText = await upstream.text().catch(() => "");
+        const ra = Number(upstream.headers.get("retry-after"));
+        lastUpstream = { status: upstream.status, ra, errText, ct: upstream.headers.get("content-type") };
+        await sleep(Number.isFinite(ra) && ra > 0 ? Math.min(ra * 1000, 5000) : 400 * (i + 1));
+        continue;
+      }
+
+      // Non-retryable (400/401/403/413/422…): pass the error through WITH
+      // CORS so the browser can read the real cause instead of masking it
+      // as a network failure.
+      const headers = new Headers(cors);
+      const ct = upstream.headers.get("content-type");
+      if (ct) headers.set("content-type", ct);
+      const ra = upstream.headers.get("retry-after");
+      if (ra) headers.set("retry-after", ra);
+      return new Response(upstream.body, { status: upstream.status, headers });
+    }
+
+    // All attempts exhausted:
+    // - A real upstream 429/5xx is passed through verbatim (status +
+    //   Retry-After) so the client's auto-retry logic works as designed.
+    // - Connection-level failures get a CORS JSON 502 with a Retry-After
+    //   hint — also auto-retried by the client.
+    if (lastUpstream) {
+      const headers = new Headers(cors);
+      if (lastUpstream.ct) headers.set("content-type", lastUpstream.ct);
+      if (lastUpstream.ra) headers.set("retry-after", String(lastUpstream.ra));
+      return new Response(lastUpstream.errText || '{"error":{"message":"Upstream error."}}', {
+        status: lastUpstream.status,
+        headers,
+      });
+    }
+    return json(
+      { error: { message: "Upstream AI provider is briefly unreachable from the proxy." } },
+      502,
+      { ...cors, "retry-after": "3" }
+    );
+}

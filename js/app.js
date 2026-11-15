@@ -752,9 +752,12 @@
         conv.messages,
         {
           onDelta: (_delta, all) => { partial = all; paint(all); },
-          onRetry: (sec) => {
+          onRetry: (sec, attempt, reason) => {
+            const label = reason === "reconnect" ? "Connection hiccup — reconnecting"
+              : reason === "server" ? "AI service busy"
+              : "Free-tier limit hit";
             shell._md.innerHTML =
-              '<p class="retry-note">⏳ Free-tier limit hit — retrying in <b>' + sec + 's</b>…</p>';
+              '<p class="retry-note">⏳ ' + label + " — retrying in <b>" + sec + 's</b>… <span class="retry-attempt">(attempt ' + attempt + ")</span></p>";
             autoScroll();
           },
           onContinue: () => {
@@ -798,9 +801,15 @@
         saveChats();
         toast(err.message || "Response interrupted", true);
       } else {
+        // Dead end after all automatic retries: keep the user's message
+        // intact and offer a one-tap retry so nothing needs retyping.
+        const msg = err.message || "Something went wrong.";
         shell._md.innerHTML =
-          '<p class="error-text">⚠️ ' + (err.message || "Something went wrong.") + "</p>";
-        toast(err.message || "Request failed", true);
+          '<p class="error-text">⚠️ ' + msg + "</p>" +
+          '<button class="retry-btn" type="button">↻ Try again</button>';
+        const btn = shell._md.querySelector(".retry-btn");
+        if (btn) btn.addEventListener("click", () => { if (!streaming) regenerateLast(); });
+        toast(msg, true);
       }
     } finally {
       streaming = false;
