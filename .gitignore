@@ -1,0 +1,6 @@
+# Generated test artifacts
+worker/*-report.json
+
+# Dependencies / logs
+node_modules/
+*.log
