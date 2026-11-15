@@ -101,13 +101,27 @@
     "5. If a request is ambiguous or missing a key detail (which date? which " +
     "version? which of several possible meanings?), ask ONE short clarifying " +
     "question first instead of guessing. If the most likely reading is obvious, " +
-    "answer it and note the assumption in one line.";
+    "answer it and note the assumption in one line.\n" +
+    "6. If a tool call fails, returns an error or nothing useful, do NOT keep " +
+    "re-calling the same tool. Try at most one different query; if that also " +
+    "fails, tell the user briefly what happened and answer from what you " +
+    "already know, noting the uncertainty.";
 
   /* Sent when a reply hits the token cap or a stream drops mid-answer. */
   const CONTINUE_PROMPT =
     "Continue the previous answer from exactly where it stopped. " +
     "Do not repeat anything you already wrote, do not apologise, and do not add a preamble. " +
     "If you were in the middle of code, continue the code seamlessly from the last character.";
+
+  /* Sent when the model keeps requesting tools after the budget ran out
+     (usually retrying a search that returned nothing useful). Forces one
+     final tools-free round so the user always gets a written answer. */
+  const TOOL_BUDGET_PROMPT =
+    "Tool budget reached — stop calling tools. Using the tool results you already " +
+    "have above (or your own knowledge, with a one-line caveat if something is " +
+    "missing), write your final answer to the user's last question now. If the " +
+    "tools failed or found nothing useful, say that briefly instead of calling " +
+    "them again.";
 
   function buildRequest(cfg, messages, systemExtra) {
     const p = PROVIDERS[cfg.provider] || PROVIDERS.openai;
@@ -536,38 +550,54 @@
         // The model asked for a tool (live weather, exact date/time…): run it
         // in the browser, feed the result back, and let it answer with real
         // data — the same loop ChatGPT uses for its built-in tools.
-        if (res.toolCalls && res.toolCalls.length && cfg.tools && cfg.tools.execute &&
-            toolRounds < MAX_TOOL_ROUNDS) {
-          toolRounds++;
-          const executed = [];
-          for (const call of res.toolCalls) {
-            if (handlers.onToolCall) handlers.onToolCall(call.name);
-            let result;
-            try {
-              const args = call.arguments ? JSON.parse(call.arguments) : {};
-              result = await cfg.tools.execute(call.name, args);
-            } catch (e) {
-              result = "Tool error: " + ((e && e.message) || "failed");
+        if (res.toolCalls && res.toolCalls.length && cfg.tools && cfg.tools.execute) {
+          if (toolRounds < MAX_TOOL_ROUNDS) {
+            toolRounds++;
+            const executed = [];
+            for (const call of res.toolCalls) {
+              if (handlers.onToolCall) handlers.onToolCall(call.name);
+              let result;
+              try {
+                const args = call.arguments ? JSON.parse(call.arguments) : {};
+                result = await cfg.tools.execute(call.name, args);
+              } catch (e) {
+                result = "Tool error: " + ((e && e.message) || "failed");
+              }
+              executed.push({
+                id: call.id || ("call_" + toolRounds + "_" + executed.length),
+                name: call.name,
+                arguments: call.arguments || "{}",
+                result: String(result),
+              });
             }
-            executed.push({
-              id: call.id || ("call_" + toolRounds + "_" + executed.length),
-              name: call.name,
-              arguments: call.arguments || "{}",
-              result: String(result),
-            });
+            msgs = msgs.concat([
+              {
+                role: "assistant",
+                content: res.text || "",
+                tool_calls: executed.map(c => ({
+                  id: c.id, type: "function",
+                  function: { name: c.name, arguments: c.arguments },
+                })),
+              },
+              ...executed.map(c => ({ role: "tool", tool_call_id: c.id, content: c.result })),
+            ]);
+            continue; // next round streams the final, data-backed answer
           }
-          msgs = msgs.concat([
-            {
-              role: "assistant",
-              content: res.text || "",
-              tool_calls: executed.map(c => ({
-                id: c.id, type: "function",
-                function: { name: c.name, arguments: c.arguments },
-              })),
-            },
-            ...executed.map(c => ({ role: "tool", tool_call_id: c.id, content: c.result })),
-          ]);
-          continue; // next round streams the final, data-backed answer
+          // Tool budget exhausted but the model STILL asks for tools (it is
+          // usually re-trying a search that returned nothing useful). Without
+          // this guard the loop used to fall through and return an EMPTY
+          // answer — the bubble stayed stuck on "Searching the web…" with no
+          // text and no error. Force one last tools-free round so the model
+          // must answer from the results it already gathered.
+          if (!toolsDisabled) {
+            toolsDisabled = true;
+            cfg = { ...cfg, tools: null };
+            msgs = msgs.concat([{ role: "user", content: TOOL_BUDGET_PROMPT }]);
+            continue;
+          }
+          // Even the forced round came back as bare tool calls: nothing left
+          // to try — the empty-answer guard below turns this into a visible,
+          // retryable error instead of a blank bubble.
         }
 
         // The model ran out of output tokens or the stream was cut off:
@@ -589,6 +619,13 @@
           if (handlers.onTruncated) handlers.onTruncated();
         }
 
+        // Never resolve with a blank reply: a "finished" empty answer used to
+        // leave the bubble stuck on the tool status ("Searching the web…")
+        // with no text and no error. Surface a clear, retryable failure so
+        // the UI shows its ↻ Try-again affordance instead.
+        if (!answer.trim()) {
+          throw new Error("The model returned an empty reply. Please try again.");
+        }
         return answer;
       } catch (err) {
         if (err && err.name === "AbortError") {

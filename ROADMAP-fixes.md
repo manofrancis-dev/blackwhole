@@ -11,7 +11,8 @@ the Cloudflare Worker (`worker/src/worker.js`).
 > search-source saga — DDG/Google-News/Mojeek all bot-challenge CF IPs, so the
 > worker races keyless sources in parallel) · Fix 4a ✅ live (name remembered
 > across chats) · Fix 4b ✅ unit-tested (mechanical rolling summary, no extra
-> API call). Upgrade path for best search quality: set a `BRAVE_API_KEY`
+> API call) · Fix 5 ✅ hotfixed (blank "finished" reply after tool rounds).
+> Upgrade path for best search quality: set a `BRAVE_API_KEY`
 > worker secret.
 
 Legend: 🟢 prompt-only · 🟡 frontend tool · 🔴 worker change
@@ -100,6 +101,33 @@ chats lose early context; no long-term memory between sessions.
 
 **Accept:** tell the bot your name in chat #1, open chat #2 → it remembers;
 in one very long chat it still recalls the first message's key details.
+
+---
+
+## Fix 5 — Blank "finished" reply after tool rounds 🟡 (hotfix, Nov 15 2026)
+
+**Problem (seen live):** "what going on in chennai today" → bubble stuck on
+"🔎 Searching the web…" with copy/retry buttons but NO text — marked finished.
+Cause: the search sources failed for that query (Mojeek 403, GDELT timeout,
+Google-News window elapsed → only irrelevant Wikipedia results), so the model
+kept re-calling `web_search` with reworded queries. After `MAX_TOOL_ROUNDS = 3`
+executions, `streamChat()` still returned only tool calls — the loop fell
+through and `return answer;` resolved with `""`. The UI pushed an empty
+assistant message, kept the tool-status paint, and showed the action icons.
+
+**Change (`js/api.js`):**
+1. When the tool budget is exhausted but the model still asks for tools, force
+   ONE final tools-free round with a nudge message (`TOOL_BUDGET_PROMPT`):
+   "answer now from the results you already have".
+2. Hard guard before returning: an empty `answer` throws a clear error
+   ("The model returned an empty reply. Please try again.") so the UI shows
+   its ⚠️ + ↻ Try-again block instead of a silent blank bubble.
+3. New `ACCURACY_PROMPT` rule 6: don't hammer a failing tool — try at most one
+   different query, then tell the user and answer from what you know.
+
+**Accept:** simulated model that returns tool calls forever → final text answer
+via the forced round (`worker/test-tools.cjs` tests 5-6, 24/24 passing); a
+model that asks for tools even when stripped → visible retryable error.
 
 ---
 

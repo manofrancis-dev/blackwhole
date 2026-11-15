@@ -127,6 +127,64 @@ async function main() {
     check("plain streaming regression", a === "hello world", a);
   }
 
+  /* ---- 5. tool budget exhausted -> forced tools-free final answer ----
+     Regression: the model kept asking for web_search (bad search results),
+     the loop ran out of rounds and streamChat returned "" — the chat then
+     showed "Searching the web…" forever with no text ("finished"). */
+  {
+    let round = 0;
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async (url, init) => {
+      const u = String(url);
+      if (u.includes("/tools/search")) {
+        return new Response(JSON.stringify({ source: "test", results: [{ title: "t", url: "https://x.test/a", snippet: "s" }] }),
+          { status: 200, headers: { "content-type": "application/json" } });
+      }
+      round++;
+      const body = JSON.parse(init.body);
+      if (round <= 4) {
+        // Rounds 1-3 get executed; round 4 still asks for tools with the
+        // budget spent — this is the round that used to return "" silently.
+        check("round " + round + " has tools", Array.isArray(body.tools));
+        return sse([
+          { choices: [{ delta: { tool_calls: [{ index: 0, id: "call_r" + round, type: "function", function: { name: "web_search", arguments: "{\"query\":\"chennai news\"}" } }] } }] },
+          { choices: [{ delta: {}, finish_reason: "tool_calls" }] },
+        ]);
+      }
+      // Forced final round: tools stripped, budget nudge appended last.
+      check("forced round has NO tools", body.tools === undefined);
+      const lastMsg = body.messages[body.messages.length - 1];
+      check("budget nudge appended last", lastMsg.role === "user" && /Tool budget reached/.test(lastMsg.content),
+        lastMsg && JSON.stringify(lastMsg).slice(0, 140));
+      return sse([
+        { choices: [{ delta: { content: "Here is what is happening in Chennai today." } }] },
+        { choices: [{ delta: {}, finish_reason: "stop" }] },
+      ]);
+    };
+    const a = await AI.streamChat(cfg, [{ role: "user", content: "what is going on in Chennai today?" }], {});
+    globalThis.fetch = origFetch;
+    check("answer forced after budget exhaustion", a === "Here is what is happening in Chennai today.", a);
+  }
+
+  /* ---- 6. model asks for tools even with tools stripped -> clear error,
+     never a silent empty resolve ---- */
+  {
+    let round = 0;
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async () => {
+      round++;
+      return sse([
+        { choices: [{ delta: { tool_calls: [{ index: 0, id: "call_x" + round, type: "function", function: { name: "web_search", arguments: "{\"query\":\"q\"}" } }] } }] },
+        { choices: [{ delta: {}, finish_reason: "tool_calls" }] },
+      ]);
+    };
+    let err = null;
+    try { await AI.streamChat(cfg, [{ role: "user", content: "q" }], {}); }
+    catch (e) { err = e; }
+    globalThis.fetch = origFetch;
+    check("empty answer surfaces as retryable error", err && /empty reply/i.test(err.message), err && err.message);
+  }
+
   console.log("\n" + pass + " passed, " + fail + " failed");
   process.exitCode = fail ? 1 : 0;
 }
