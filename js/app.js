@@ -10,13 +10,12 @@
 
   const $ = (id) => document.getElementById(id);
 
-  // Built-in Groq key: everyone uses this by default, so the API-key prompt
-  // never appears. Replace it here if the key is rotated.
-  const BUILT_IN_API_KEY = "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";
-
+  // The AI runs through Blackwhole's own server-side proxy (see js/api.js
+  // PROXY_URL and worker/). No API key lives in this bundle, so it can never
+  // leak on GitHub or be revoked by a provider scan again.
   let settings = {
-    provider: "groq",
-    apiKey: BUILT_IN_API_KEY,
+    provider: "blackwhole",
+    apiKey: "",
     model: "openai/gpt-oss-120b",
     baseUrl: "",
     systemPrompt: "You are Blackwhole, a helpful, friendly AI assistant created by Mano Francis. Answer clearly and concisely, using markdown formatting when useful.",
@@ -29,14 +28,15 @@
   let searchQuery = "";
 
   function loadState() {
-    try { Object.assign(settings, JSON.parse(localStorage.getItem(SETTINGS_KEY)) || {}); } catch {}
+    let saved = null;
+    try { saved = JSON.parse(localStorage.getItem(SETTINGS_KEY)) || {}; } catch {}
 
-    // Pre-configured for Groq + openai/gpt-oss-120b with the built-in key.
-    // Ignore any old/stale values so every user gets the same working setup.
-    settings.provider = "groq";
-    settings.apiKey = BUILT_IN_API_KEY;
-    settings.model = "openai/gpt-oss-120b";
-    settings.temperature = 0.7;
+    // Settings v2: the AI moved behind the free server-side proxy. Old saved
+    // settings (with the revoked built-in key) are discarded once, cleanly.
+    if (saved && saved.settingsVersion === 2) {
+      Object.assign(settings, saved);
+    }
+    settings.settingsVersion = 2;
 
     try { chats = JSON.parse(localStorage.getItem(CHATS_KEY)) || []; } catch { chats = []; }
     if (!Array.isArray(chats)) chats = [];
@@ -47,7 +47,11 @@
   function currentChat() { return chats.find(c => c.id === currentId) || null; }
   function provider() { return AI.PROVIDERS[settings.provider] || AI.PROVIDERS.openai; }
   function modelName() { return settings.model || provider().defaultModel || "custom model"; }
-  function hasKey() { return !!settings.apiKey || settings.provider === "custom"; }
+  function hasKey() {
+    // The blackwhole provider needs no key — the proxy authenticates
+    // server-side.
+    return settings.provider === "blackwhole" || !!settings.apiKey || settings.provider === "custom";
+  }
   function uid() { return "c" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
 
   /* ---------- Intro splash (cinematic, click/key to skip) ---------- */
@@ -850,19 +854,21 @@
     $("modelInput").placeholder = p.defaultModel || "your-model-name";
     $("baseUrlField").classList.toggle("field-hidden", prov !== "custom");
     $("tempValue").textContent = $("tempInput").value;
-    $("providerHint").textContent =
-      "Using the built-in free Groq key — no setup needed.";
+    $("providerHint").textContent = p.noKey
+      ? "Using Blackwhole's free built-in AI service — no key or setup needed."
+      : "Using the built-in free Groq key — no setup needed.";
   }
   $("providerSelect").addEventListener("change", syncProviderUI);
   $("tempInput").addEventListener("input", () => { $("tempValue").textContent = $("tempInput").value; });
 
   $("settingsSave").addEventListener("click", () => {
-    // Keep the working Groq setup pinned no matter what is in the DOM.
-    settings.provider = "groq";
-    settings.apiKey = BUILT_IN_API_KEY;
-    settings.model = "openai/gpt-oss-120b";
-    settings.baseUrl = "";
-    settings.temperature = 0.7;
+    settings.provider = $("providerSelect").value || "blackwhole";
+    settings.apiKey = $("apiKeyInput").value.trim();
+    settings.model = $("modelInput").value.trim() ||
+      (AI.PROVIDERS[settings.provider] || {}).defaultModel || "openai/gpt-oss-120b";
+    settings.baseUrl = $("baseUrlInput").value.trim();
+    settings.systemPrompt = $("systemPromptInput").value;
+    settings.temperature = parseFloat($("tempInput").value) || 0.7;
     saveSettings();
     closeSettings();
     updateKeyStatus();

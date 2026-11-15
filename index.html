@@ -267,15 +267,16 @@
           <div class="settings-row"><span>Provider</span><b>blackwhole</b></div>
           <div class="settings-row"><span>Model</span><b>model/bw-m1-medium</b></div>
           <div class="settings-row"><span>Temperature</span><b>0.7</b></div>
-          <div class="settings-row"><span>API key</span><b class="ok">Built-in · ready</b></div>
+          <div class="settings-row"><span>API key</span><b class="ok">Free server · no key needed</b></div>
         </div>
         <label class="field" hidden>
           <span>Provider</span>
           <select id="providerSelect">
+            <option value="blackwhole" selected>Blackwhole (Free)</option>
             <option value="openai">OpenAI</option>
             <option value="anthropic">Anthropic (Claude)</option>
             <option value="openrouter">OpenRouter</option>
-            <option value="groq" selected>Groq</option>
+            <option value="groq">Groq</option>
             <option value="custom">Custom (OpenAI-compatible)</option>
           </select>
         </label>
@@ -316,8 +317,8 @@
 
   <div id="toast" class="toast hidden"></div>
 
-  <script src="js/markdown.js?v=16"></script>
-  <script src="js/api.js?v=16"></script>
-  <script src="js/app.js?v=16"></script>
+  <script src="js/markdown.js?v=17"></script>
+  <script src="js/api.js?v=17"></script>
+  <script src="js/app.js?v=17"></script>
 </body>
 </html>

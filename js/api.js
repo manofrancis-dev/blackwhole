@@ -1,10 +1,27 @@
 /* AI provider clients with streaming (SSE) support.
-   Works directly from the browser; the key never leaves the user's machine
-   except in the request to the chosen provider. */
+   Default provider: Blackwhole's own proxy — the key lives server-side in the
+   worker and is never exposed to the browser. User-supplied providers still
+   work directly from the browser. */
 (function () {
   "use strict";
 
+  /* Blackwhole's free AI proxy (Cloudflare Worker, see worker/). It holds the
+     Groq API key server-side, so no key ever ships in this public bundle and
+     visitors chat with zero setup. If the key ever needs rotating, it is
+     updated as a worker secret — no code change and no redeploy here. */
+  const PROXY_URL = "https://blackwhole-proxy.manofrancis.workers.dev";
+
   const PROVIDERS = {
+    // Default: our own worker proxy. noKey = the browser sends no API key;
+    // the worker injects the secret key server-side.
+    blackwhole: {
+      label: "Blackwhole (Free)",
+      baseUrl: PROXY_URL + "/v1",
+      defaultModel: "openai/gpt-oss-120b",
+      keyUrl: "",
+      style: "openai",
+      noKey: true,
+    },
     openai: {
       label: "OpenAI",
       baseUrl: "https://api.openai.com/v1",
@@ -93,7 +110,9 @@
 
     // Groq's free tier has a tight tokens-per-minute budget. Keep each request
     // small, and for gpt-oss models use light reasoning to save output tokens.
-    const isGroq = cfg.provider === "groq";
+    // The blackwhole provider is Groq behind our own proxy, so the same
+    // free-tier limits apply.
+    const isGroq = cfg.provider === "groq" || cfg.provider === "blackwhole";
     // gpt-oss counts hidden reasoning against max_tokens, so a small cap like
     // 1200 cut long code answers in half. Size the budget from the actual
     // prompt instead, keeping the whole request under the free-tier TPM limit.
@@ -110,12 +129,14 @@
     };
     if (isGroq && /gpt-oss/i.test(model)) body.reasoning_effort = "low";
 
+    const headers = { "content-type": "application/json" };
+    // noKey providers (the blackwhole proxy) inject the key server-side —
+    // the browser never sends one.
+    if (!p.noKey && cfg.apiKey) headers.authorization = "Bearer " + cfg.apiKey;
+
     return {
       url: base + "/chat/completions",
-      headers: {
-        "content-type": "application/json",
-        "authorization": "Bearer " + cfg.apiKey,
-      },
+      headers,
       body: JSON.stringify(body),
     };
   }
@@ -151,7 +172,7 @@
     return Math.min(sec, 90);
   }
 
-  async function readError(res) {
+  async function readError(res, noKey) {
     let detail = "";
     try {
       const text = await res.text();
@@ -169,6 +190,11 @@
     };
 
     if (res.status === 401 || res.status === 403) {
+      if (noKey) {
+        // Our proxy is authenticated server-side; a 401 here means the server
+        // key needs renewal — nothing the visitor can (or should) fix.
+        fail("Blackwhole's free AI service is temporarily unavailable. Please try again in a few minutes.");
+      }
       fail("Invalid API key (HTTP " + res.status + "). Check it in Settings. " + detail);
     }
 
@@ -212,14 +238,24 @@
   async function attempt(cfg, messages, { onDelta, signal } = {}) {
     const p = PROVIDERS[cfg.provider] || PROVIDERS.openai;
     const req = buildRequest(cfg, messages);
-    const res = await fetch(req.url, {
-      method: "POST",
-      headers: req.headers,
-      body: req.body,
-      signal,
-    });
+    let res;
+    try {
+      res = await fetch(req.url, {
+        method: "POST",
+        headers: req.headers,
+        body: req.body,
+        signal,
+      });
+    } catch (err) {
+      if (err && err.name === "AbortError") throw err;
+      if (p.noKey) {
+        // Our proxy is down or unreachable — not something the visitor caused.
+        throw new Error("Blackwhole's free AI service is unreachable right now. Please try again shortly.");
+      }
+      throw err;
+    }
 
-    if (!res.ok) await readError(res);
+    if (!res.ok) await readError(res, p.noKey);
     if (!res.body) throw new Error("Streaming not supported by this browser.");
 
     const reader = res.body.getReader();
@@ -321,8 +357,13 @@
    * @returns {Promise<string>} full assistant text
    */
   async function streamChat(cfg, messages, handlers = {}) {
-    if (!cfg.apiKey && cfg.provider !== "custom") {
+    const p = PROVIDERS[cfg.provider] || PROVIDERS.openai;
+    if (!p.noKey && !cfg.apiKey && cfg.provider !== "custom") {
       throw new Error("No API key set. Open Settings (bottom-left) to add one.");
+    }
+    if (p.noKey && p.baseUrl.includes("<")) {
+      // Deployment safety net: the proxy URL was never filled in.
+      throw new Error("Blackwhole's free AI service is being set up. Please check back soon.");
     }
     if (cfg.provider === "custom" && !cfg.baseUrl) {
       throw new Error("Custom provider needs a Base URL in Settings.");

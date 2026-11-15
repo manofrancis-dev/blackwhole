@@ -20,8 +20,8 @@ browser and you're ready to chat with a real AI.
 - **Fully responsive** — works great on phones (collapsible sidebar)
 - **Stop generation** — halt a response mid-stream like the real thing
 - **Regenerate** — re-roll the last answer
-- **Zero setup** — ships with a built-in Groq key; **Groq + `openai/gpt-oss-120b`**
-  and temperature **0.7** are pre-configured, so users just open it and chat
+- **Zero setup** — chats through Blackwhole's own free AI proxy; no key lives
+  in the browser, users just open it and chat
 - **Rate-limit friendly** — context is trimmed to fit the free tier and
   token-per-minute limits are retried automatically instead of failing
 - **Safe rendering** — all AI/user text is HTML-escaped before markdown parsing
@@ -40,18 +40,17 @@ browser and you're ready to chat with a real AI.
 
 ## 🔒 About the built-in API key
 
-The Groq key is compiled into `js/app.js` (`BUILT_IN_API_KEY`) so every visitor
-can chat with zero setup. That also means:
+Requests go through **Blackwhole's own proxy** (see `worker/`) — a tiny free
+Cloudflare Worker that holds the Groq key server-side:
 
-- **Anyone who opens the page can read the key** (open DevTools → Sources, or
-  just view `js/app.js`). This is how client-side apps work — there is no way to
-  hide a key in front-end code.
-- Anyone can use the key and consume the free quota, so treat it as a **public,
-  shared key**. Rotate it at https://console.groq.com/keys if it gets abused.
-- For a truly private/production setup, move the request behind a tiny backend
-  proxy and keep the key on the server.
+- **No key ships in the frontend**, so it can't be found by provider scanners
+  or abused by viewers (this exact thing killed the old hardcoded key with
+  HTTP 401 — see `worker/README.md` for the full story).
+- Visitors chat with zero setup; no key prompt ever appears.
+- If the key ever needs rotating, it's one `wrangler secret put` command —
+  no code change, no redeploy, users never notice.
 
-To swap the key, edit `BUILT_IN_API_KEY` at the top of `js/app.js`.
+Users can still bring their own provider/key via the settings fields if wanted.
 
 ## ⌨️ Controls
 
@@ -74,8 +73,9 @@ ai-chatbot-v2/
 ├── index.html            # Page + SEO metadata + JSON-LD
 ├── css/styles.css        # ChatGPT-style themes & layout (light/dark)
 ├── js/markdown.js        # Safe markdown → HTML renderer
-├── js/api.js             # Streaming clients for OpenAI-compatible & Anthropic APIs
-├── js/app.js             # UI logic: chats, storage, streaming, built-in key
+├── js/api.js             # Streaming clients + free AI proxy provider
+├── js/app.js             # UI logic: chats, storage, streaming
+├── worker/               # Cloudflare Worker proxy (holds the API key server-side)
 ├── assets/icons/         # Favicons 16–512 px, Apple touch icon, maskable icon
 ├── assets/og-image.png   # Social share image (1200×630)
 ├── favicon.ico           # Root favicon (Google search result icon)
@@ -128,14 +128,12 @@ until it recrawls the favicon; the files are correct, so it will update.
 
 ## 🛠️ Troubleshooting
 
-- **Invalid API key (HTTP 401/403)** — the built-in key was revoked or rotated;
-  replace `BUILT_IN_API_KEY` in `js/app.js`.
-- **Rate limit reached / tokens-per-minute (HTTP 413 or 429)** — Groq's free tier
-  allows ~8,000 tokens per minute. Blackwhole trims older messages automatically
-  before each send and retries automatically. If it still happens: wait about a
-  minute, shorten your message, start a new chat, or upgrade at console.groq.com.
-- **Empty response** — Groq may be having an outage; try again in a moment.
-- **Key exhausted by other users** — the key is shared publicly; create a new one
-  at https://console.groq.com/keys and update `js/app.js`.
+- **Invalid API key (HTTP 401/403)** — with the proxy setup this should not
+  happen: the key lives server-side in the Cloudflare Worker. If it ever does,
+  rotate it: `npx wrangler secret put GROQ_API_KEY` (from `worker/`) — see
+  `worker/README.md`.
+- **"Free AI service temporarily unavailable"** — the proxy worker is down,
+  misconfigured, or its key needs renewal. Check `GET <proxy-url>/health`,
+  then rotate the secret.
 
 Enjoy! 🕳️ Blackwhole
