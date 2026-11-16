@@ -305,9 +305,14 @@ async function handle(request, env) {
       const tierB = [
         ["duckduckgo", shortWait(searchDuckDuckGo(q))],
         ["mojeek", shortWait(searchMojeek(q))],
-        ["google-news", shortWait(searchGoogleNewsRss(q))],
       ];
+      /* google-news sits first in tier A with a real window: from a cold
+         Worker it needs ~2-4 s, so the 1.6 s tier-B cutoff always killed it
+         and news queries degraded to HN-by-date (stale, low-signal posts).
+         It is the most reliable keyless news source from Cloudflare, so it
+         outranks gdelt (often >6 s) and hn here. */
       const tierA = [
+        ["google-news", longWait(searchGoogleNewsRss(q), "google-news")],
         ...(env.BRAVE_API_KEY ? [["brave", longWait(searchBrave(q, env), "brave")]] : []),
         ["gdelt", longWait(searchGdelt(q), "gdelt")],
         ["hn", longWait(searchHackerNews(q), "hn")],
