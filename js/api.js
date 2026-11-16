@@ -222,7 +222,10 @@
   }
 
   /* Read how long the provider asks us to wait (Retry-After header or the
-     "Please try again in 7.5s" text inside the error body). */
+     "Please try again in 7.5s" text inside the error body). Groq's daily
+     quota (TPD) returns long waits like "8m54.816s" and a Retry-After of
+     hundreds of seconds — honour them (capped) instead of chopping every
+     wait to 90 s, which just burned all retries before the quota reset. */
   function parseRetryAfter(res, detail) {
     let sec = NaN;
     try {
@@ -230,15 +233,19 @@
       if (h) sec = Number(h);
     } catch { /* ignore */ }
     if (!Number.isFinite(sec)) {
-      const m = /try again in\s+([\d.]+)\s*(ms|s|sec|seconds?)?/i.exec(detail || "");
+      // Matches "7.5s", "900 ms" and minute forms like "8m54.816s".
+      const m = /try again in\s+(?:(\d+)\s*m(?:in)?(?:utes)?)?\s*([\d.]+)\s*(ms|s|sec|seconds?)?/i.exec(detail || "");
       if (m) {
-        const n = Number(m[1]);
-        const unit = (m[2] || "s").toLowerCase();
-        sec = unit.startsWith("ms") ? n / 1000 : n;
+        const minutes = m[1] ? Number(m[1]) : 0;
+        const n = Number(m[2]);
+        const unit = (m[3] || "s").toLowerCase();
+        sec = minutes * 60 + (unit.startsWith("ms") ? n / 1000 : n);
       }
     }
     if (!Number.isFinite(sec) || sec <= 0) sec = 20;
-    return Math.min(sec, 90);
+    // Cap: long enough for a daily-quota window (~9 min), short enough that
+    // the UI countdown stays sane. Retries in total stay bounded elsewhere.
+    return Math.min(sec, 660);
   }
 
   async function readError(res, noKey) {
@@ -663,11 +670,20 @@
         // trim a little more, and retry automatically.
         if (err && err.status === 429 && retries < MAX_RETRIES) {
           retries++;
-          const waitSec = Math.min(Math.ceil(err.retryAfter || 20), 90);
+          const waitSec = Math.min(Math.ceil(err.retryAfter || 20), 660);
           if (handlers.onRetry) handlers.onRetry(waitSec, retries, "rate");
           await delay(waitSec * 1000, handlers.signal);
           budget = Math.max(1000, Math.floor(budget * 0.8));
           continue;
+        }
+
+        // Rate limit still failing after every retry (usually the free
+        // plan's daily token quota): stop with an honest message instead of
+        // claiming "retrying automatically…" one last time.
+        if (err && err.status === 429) {
+          throw new Error(cfg.provider === "blackwhole"
+            ? "The free AI quota is used up right now. Please try again in a few minutes."
+            : "Rate limit didn't clear after several retries. Please try again in a few minutes.");
         }
 
         // Transient network hiccup (connection reset, DNS blip, our proxy
