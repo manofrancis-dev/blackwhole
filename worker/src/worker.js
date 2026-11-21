@@ -24,14 +24,88 @@ const ENTITIES = {
   amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ", ndash: "–", mdash: "—",
 };
 
+function safeCodePoint(n) {
+  n = Number(n);
+  if (!Number.isFinite(n) || n <= 0 || n > 0x10FFFF) return null;
+  // Reject lone surrogates that would form invalid UTF-16.
+  if (n >= 0xD800 && n <= 0xDFFF) return null;
+  try { return String.fromCodePoint(n); } catch { return null; }
+}
 function decodeEntities(s) {
   return String(s)
-    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
-    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(+n))
+    .replace(/&#x([0-9a-f]+);/gi, (m, h) => {
+      const cp = safeCodePoint(parseInt(h, 16));
+      return cp === null ? m : cp;
+    })
+    .replace(/&#(\d+);/g, (m, n) => {
+      const cp = safeCodePoint(+n);
+      return cp === null ? m : cp;
+    })
     .replace(/&([a-z]+);/gi, (m, name) => ENTITIES[name.toLowerCase()] ?? m);
 }
 
 /* Strip scripts/styles/tags/comments and collapse whitespace to plain text. */
+/* SSRF guard: block loopback / private / link-local / metadata hosts. */
+function isPrivateHost(host) {
+  const h = String(host || "").toLowerCase().replace(/^\[|\]$/g, "");
+  if (!h) return true;
+  if (h === "localhost" || h.endsWith(".localhost")) return true;
+  // Cloud metadata hostnames
+  if (h === "metadata.google.internal" || h === "169.254.169.254") return true;
+  // IPv4-mapped / decimal / short-form guards.
+  if (/^\d+$/.test(h)) return true; // decimal IP
+  if (h.includes(":")) {
+    // IPv6 literal
+    if (h === "::1" || h === "0:0:0:0:0:0:0:1") return true;
+    if (h.startsWith("fe80:") || h.startsWith("fc") || h.startsWith("fd")) return true;
+    // Block all IPv4-mapped IPv6 (::ffff:*) — they wrap an IPv4 address and
+    // are a common SSRF bypass (Node normalizes dotted form to hex).
+    if (h.startsWith("::ffff:")) return true;
+    // 6to4 / teredo carrying private IPv4
+    return false;
+  }
+  // IPv4 (and short forms like 127.1)
+  const parts = h.split(".");
+  if (parts.length >= 2 && parts.length <= 4 && parts.every(p => /^\d{1,3}$/.test(p))) {
+    // Normalize short forms by padding with zeros.
+    const nums = parts.map(Number);
+    while (nums.length < 4) nums.push(0);
+    const [a, b] = nums;
+    if (a === 10) return true;
+    if (a === 127) return true;
+    if (a === 0) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true;
+  }
+  return false;
+}
+
+/* Read a response body up to maxBytes to avoid unbounded memory use. */
+async function readCapped(res, maxBytes) {
+  if (!res.body) return await res.text();
+  const reader = res.body.getReader();
+  let total = 0;
+  const decoder = new TextDecoder();
+  let out = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) {
+      total += value.byteLength;
+      if (total > maxBytes) {
+        try { await reader.cancel(); } catch {}
+        out += decoder.decode(value, { stream: true });
+        break;
+      }
+      out += decoder.decode(value, { stream: true });
+    }
+  }
+  out += decoder.decode();
+  return out;
+}
+
 function htmlToText(html) {
   return decodeEntities(
     String(html)
@@ -288,19 +362,29 @@ async function handle(request, env) {
       const pickFrom = async (jobs) => {
         for (const [name, p] of jobs) {
           try {
-            const r = await p;
-            if (r.length) { source = name; results = r; return true; }
+            const res = await p;
+            const r = (res && res.__ok) ? res.value : res;
+            if (Array.isArray(r) && r.length) { source = name; results = r; return true; }
+            if (res && !res.__ok && res.error) {
+              if (errors) errors[name] = String((res.error && res.error.message) || res.error);
+            }
           } catch (e) {
             if (errors) errors[name] = String((e && e.message) || e);
           }
         }
         return false;
       };
+      const safe = (p) => p.then(
+        (v) => ({ __ok: true, value: v }),
+        (e) => ({ __ok: false, error: e })
+      );
       const shortWait = (p) => Promise.race([
-        p, new Promise((_, rej) => setTimeout(() => rej(new Error("tier-b window elapsed")), 1600)),
+        safe(p),
+        new Promise((resolve) => setTimeout(() => resolve({ __ok: false, error: new Error("tier-b window elapsed") }), 1600)),
       ]);
       const longWait = (p, name) => Promise.race([
-        p, new Promise((_, rej) => setTimeout(() => rej(new Error(name + " timed out")), 6000)),
+        safe(p),
+        new Promise((resolve) => setTimeout(() => resolve({ __ok: false, error: new Error(name + " timed out") }), 6000)),
       ]);
       const tierB = [
         ["duckduckgo", shortWait(searchDuckDuckGo(q))],
@@ -332,31 +416,61 @@ async function handle(request, env) {
       if (!/^https?:\/\//i.test(target)) {
         return json({ error: { message: "Missing or invalid url (must start with http:// or https://)." } }, 400, cors);
       }
-      let host = "";
-      try { host = new URL(target).hostname; } catch {
+      let parsed;
+      try { parsed = new URL(target); } catch {
         return json({ error: { message: "Invalid url." } }, 400, cors);
       }
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        return json({ error: { message: "Only http/https URLs are allowed." } }, 400, cors);
+      }
       // Refuse to read this proxy itself — a self-fetch would recurse.
-      if (host === url.hostname) {
+      if (parsed.hostname === url.hostname) {
         return json({ error: { message: "Refusing to read this proxy." } }, 400, cors);
+      }
+      // SSRF hardening: never fetch private/loopback/link-local/metadata hosts.
+      if (isPrivateHost(parsed.hostname)) {
+        return json({ error: { message: "Refusing to read a non-public host." } }, 400, cors);
       }
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), 10000);
       try {
-        const upstream = await fetch(target, {
-          signal: ctrl.signal,
-          redirect: "follow",
-          headers: { "user-agent": BROWSER_UA, "accept": "text/html,application/xhtml+xml,text/plain,*/*" },
-        });
+        // Follow redirects manually so each hop is re-validated.
+        let current = target;
+        let upstream = null;
+        for (let hop = 0; hop < 5; hop++) {
+          const r = await fetch(current, {
+            signal: ctrl.signal,
+            redirect: "manual",
+            headers: { "user-agent": BROWSER_UA, "accept": "text/html,application/xhtml+xml,text/plain,*/*" },
+          });
+          if (r.status >= 300 && r.status < 400) {
+            const loc = r.headers.get("location");
+            if (!loc) { upstream = r; break; }
+            let next;
+            try { next = new URL(loc, current); } catch { throw new Error("bad redirect"); }
+            if (next.protocol !== "http:" && next.protocol !== "https:") throw new Error("bad redirect protocol");
+            if (next.hostname === url.hostname) throw new Error("redirect to proxy");
+            if (isPrivateHost(next.hostname)) throw new Error("redirect to private host");
+            current = next.toString();
+            continue;
+          }
+          upstream = r;
+          break;
+        }
+        if (!upstream) throw new Error("too many redirects");
+
         const ct = upstream.headers.get("content-type") || "";
         if (!upstream.ok) {
-          return json({ error: { message: "Upstream HTTP " + upstream.status + " for " + host } }, 502, cors);
+          return json({ error: { message: "Upstream HTTP " + upstream.status + " for " + parsed.hostname } }, 502, cors);
         }
-        const body = await upstream.text();
+        if (ct && !/text\/|application\/(json|xml|xhtml\+xml|javascript)/i.test(ct)) {
+          return json({ error: { message: "Unsupported content type: " + ct } }, 415, cors);
+        }
+        const body = await readCapped(upstream, 1000000);
         const text = (/html|xml/i.test(ct) || /^\s*</.test(body) ? htmlToText(body) : body)
           .slice(0, 8000);
         return json({
-          url: upstream.url || target,
+          url: upstream.url || current,
           content_type: ct,
           truncated: text.length >= 8000,
           text,

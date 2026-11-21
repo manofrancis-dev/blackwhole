@@ -9,6 +9,10 @@
   const THEME_KEY = "blackwhole.theme";
 
   const $ = (id) => document.getElementById(id);
+  function escapeHtml(s) {
+    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  }
 
   // The AI runs through Blackwhole's own server-side proxy (see js/api.js
   // PROXY_URL and worker/). No API key lives in this bundle, so it can never
@@ -26,31 +30,95 @@
   let streaming = false;
   let abortCtrl = null;
   let searchQuery = "";
+  const SOUND_KEY = "blackwhole.sound";
+  let soundEnabled = (localStorage.getItem(SOUND_KEY) !== "off");
+
+  /* ---------- Sound effects (Web Audio) ---------- */
+  let audioCtx = null;
+  function getAudioCtx() {
+    if (!audioCtx) {
+      try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch { audioCtx = null; }
+    }
+    return audioCtx;
+  }
+  function playTone(freq, dur, type, gain) {
+    if (!soundEnabled) return;
+    const ctx = getAudioCtx();
+    if (!ctx) return;
+    try {
+      const osc = ctx.createOscillator();
+      const g = ctx.createGain();
+      osc.type = type || "sine";
+      osc.frequency.value = freq;
+      g.gain.value = gain || 0.08;
+      osc.connect(g); g.connect(ctx.destination);
+      osc.start();
+      g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + dur);
+      osc.stop(ctx.currentTime + dur);
+    } catch { /* ignore */ }
+  }
+  function soundSend() { playTone(660, 0.08, "sine", 0.06); }
+  function soundReceive() { playTone(880, 0.12, "sine", 0.05); setTimeout(() => playTone(1100, 0.1, "sine", 0.04), 120); }
+
+  /* ---------- Favicon animation while streaming ---------- */
+  const originalFavicon = document.querySelector('link[rel="icon"][sizes="32x32"]')?.href || "assets/icons/favicon-32x32.png";
+  let faviconAnim = null;
+  function startFaviconAnim() {
+    const link = document.querySelector('link[rel="icon"][sizes="32x32"]') || document.querySelector('link[rel="icon"]');
+    if (!link) return;
+    const canvas = document.createElement("canvas");
+    canvas.width = 32; canvas.height = 32;
+    const ctx = canvas.getContext("2d");
+    let angle = 0;
+    faviconAnim = setInterval(() => {
+      ctx.clearRect(0, 0, 32, 32);
+      ctx.fillStyle = "#06060e";
+      ctx.fillRect(0, 0, 32, 32);
+      ctx.strokeStyle = "#a78bfa";
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(16, 16, 10, angle, angle + Math.PI * 1.5);
+      ctx.stroke();
+      link.href = canvas.toDataURL("image/png");
+      angle += 0.15;
+    }, 80);
+  }
+  function stopFaviconAnim() {
+    if (faviconAnim) { clearInterval(faviconAnim); faviconAnim = null; }
+    const link = document.querySelector('link[rel="icon"][sizes="32x32"]') || document.querySelector('link[rel="icon"]');
+    if (link) link.href = originalFavicon;
+  }
 
   function loadState() {
     let saved = null;
     try { saved = JSON.parse(localStorage.getItem(SETTINGS_KEY)) || {}; } catch {}
 
-    // Settings v2: the AI moved behind the free server-side proxy. Old saved
-    // settings (with the revoked built-in key) are discarded once, cleanly.
-    if (saved && saved.settingsVersion === 2) {
+    // Settings v4: default moved back to Blackwhole (Groq) — Pollinations
+    // turned out to be unreliable (404/429, 1 request at a time per IP).
+    // Older saved settings are discarded once, cleanly.
+    if (saved && saved.settingsVersion === 4) {
       Object.assign(settings, saved);
     }
-    settings.settingsVersion = 2;
+    settings.settingsVersion = 4;
 
     try { chats = JSON.parse(localStorage.getItem(CHATS_KEY)) || []; } catch { chats = []; }
     if (!Array.isArray(chats)) chats = [];
   }
-  function saveSettings() { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); }
-  function saveChats() { localStorage.setItem(CHATS_KEY, JSON.stringify(chats)); }
+  function saveSettings() {
+    try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); return true; }
+    catch (e) { try { toast("Could not save settings (storage blocked or full)", true); } catch {} return false; }
+  }
+  function saveChats() {
+    try { localStorage.setItem(CHATS_KEY, JSON.stringify(chats)); return true; }
+    catch (e) { try { toast("Could not save chats (storage blocked or full)", true); } catch {} return false; }
+  }
 
   function currentChat() { return chats.find(c => c.id === currentId) || null; }
   function provider() { return AI.PROVIDERS[settings.provider] || AI.PROVIDERS.openai; }
   function modelName() { return settings.model || provider().defaultModel || "custom model"; }
   function hasKey() {
-    // The blackwhole provider needs no key — the proxy authenticates
-    // server-side.
-    return settings.provider === "blackwhole" || !!settings.apiKey || settings.provider === "custom";
+    // noKey providers (blackwhole proxy, Pollinations) need no key.
+    return (provider() && provider().noKey) || !!settings.apiKey || settings.provider === "custom";
   }
   function uid() { return "c" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
 
@@ -62,7 +130,9 @@
     const statusEl = $("introStatus");
     const canvas = $("introCanvas");
     const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    const DURATION = reduce ? 900 : 3200;
+    // Shorter splash so the chat feels instant (ChatGPT-like) while keeping
+    // the cinematic intro.
+    const DURATION = reduce ? 500 : 1400;
 
     let finished = false;
     let raf = null;
@@ -70,9 +140,9 @@
 
     const phases = [
       [0, "INITIALIZING INTERFACE"],
-      [800, "CALIBRATING NEURAL CORE"],
-      [1600, "SYNCING KNOWLEDGE"],
-      [2400, "READY"],
+      [350, "CALIBRATING NEURAL CORE"],
+      [700, "SYNCING KNOWLEDGE"],
+      [1050, "READY"],
     ];
     const timers = phases.map(([t, txt]) => setTimeout(() => {
       if (statusEl && !finished) statusEl.textContent = txt;
@@ -193,6 +263,24 @@
     applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
   });
 
+  function applySoundState() {
+    const icon = $("soundIcon");
+    if (icon) {
+      icon.innerHTML = soundEnabled
+        ? '<path d="M11 5L6 9H2v6h4l5 4V5zM15.5 8.5a4.5 4.5 0 0 1 0 7M19 5a8 8 0 0 1 0 14"/>'
+        : '<path d="M11 5L6 9H2v6h4l5 4V5zM23 9l-6 6M17 9l6 6"/>';
+    }
+    const btn = $("soundToggle");
+    if (btn) btn.title = soundEnabled ? "Sound effects on" : "Sound effects off";
+  }
+  applySoundState();
+  $("soundToggle").addEventListener("click", () => {
+    soundEnabled = !soundEnabled;
+    localStorage.setItem(SOUND_KEY, soundEnabled ? "on" : "off");
+    applySoundState();
+    if (soundEnabled) soundSend();
+  });
+
   /* ---------- Sidebar ---------- */
   const mobileQuery = window.matchMedia("(max-width: 820px), (max-height: 560px) and (orientation: landscape)");
   function isMobile() { return mobileQuery.matches; }
@@ -247,13 +335,13 @@
 
   function chatMatches(c, q) {
     if (!q) return true;
-    if ((c.title || "").toLowerCase().includes(q)) return true;
-    return (c.messages || []).some(m => (m.content || "").toLowerCase().includes(q));
+    if (String(c.title || "").toLowerCase().includes(q)) return true;
+    return (c.messages || []).some(m => String(m.content || "").toLowerCase().includes(q));
   }
   function chatSnippet(c, q) {
-    const m = (c.messages || []).find(m => (m.content || "").toLowerCase().includes(q));
+    const m = (c.messages || []).find(m => String(m.content || "").toLowerCase().includes(q));
     if (!m) return "";
-    const text = m.content.replace(/\s+/g, " ").trim();
+    const text = String(m.content || "").replace(/\s+/g, " ").trim();
     const i = text.toLowerCase().indexOf(q);
     if (i < 0) return "";
     const start = Math.max(0, i - 26);
@@ -451,7 +539,7 @@
 
   function addAssistantShell() {
     const el = buildMessage("assistant");
-    el._md.innerHTML = '<div class="typing-dots"><span></span><span></span><span></span></div>';
+    el._md.innerHTML = '<div class="typing-dots"><span></span><span></span><span></span></div><span class="typing-label">Thinking…</span>';
     return el;
   }
 
@@ -642,6 +730,33 @@
       if (!streaming) send();
     }
   });
+
+  /* ---------- Offline queue ---------- */
+  const OFFLINE_Q_KEY = "blackwhole.offlineQueue";
+  function offlineQueue() {
+    try { return JSON.parse(localStorage.getItem(OFFLINE_Q_KEY) || "[]"); } catch { return []; }
+  }
+  function saveOfflineQueue(q) {
+    try { localStorage.setItem(OFFLINE_Q_KEY, JSON.stringify(q)); } catch {}
+  }
+  function enqueueOffline(text) {
+    const q = offlineQueue();
+    q.push({ text, ts: Date.now() });
+    saveOfflineQueue(q);
+    toast("You're offline. Message queued — will send when back online.", true);
+  }
+  async function flushOfflineQueue() {
+    const q = offlineQueue();
+    if (!q.length) return;
+    saveOfflineQueue([]);
+    for (const item of q) {
+      try { sendMessage(item.text); await new Promise(r => setTimeout(r, 300)); } catch {}
+    }
+    toast("Sent " + q.length + " queued message(s).");
+  }
+  window.addEventListener("online", flushOfflineQueue);
+  // Try flushing on load if there are queued messages.
+  setTimeout(() => { if (navigator.onLine) flushOfflineQueue(); }, 1500);
   sendBtn.addEventListener("click", () => { streaming ? stopStreaming() : send(); });
 
   function stopStreaming() {
@@ -651,6 +766,8 @@
   function send() {
     const text = input.value.trim();
     if (!text || streaming) return;
+    if (!navigator.onLine) { enqueueOffline(text); input.value = ""; autoGrow(); updateSendBtn(); return; }
+    soundSend();
     if (!hasKey()) {
       toast("Add your API key first", true);
       openSettings();
@@ -732,15 +849,17 @@
     streaming = true;
     abortCtrl = new AbortController();
     updateSendBtn();
+    startFaviconAnim();
 
     const shell = addAssistantShell();
     autoScroll(true);
     let full = "";
     let partial = "";
     let gotFirst = false;
+    let abortedEmpty = false;
 
     const paint = (text) => {
-      if (!gotFirst) { shell._md.innerHTML = ""; gotFirst = true; }
+      if (!gotFirst) { shell._md.innerHTML = ""; gotFirst = true; soundReceive(); }
       shell._md.innerHTML = Markdown.render(text);
       shell._md.classList.add("streaming-cursor");
       autoScroll();
@@ -757,7 +876,7 @@
               : reason === "server" ? "AI service busy"
               : "Free-tier limit hit";
             shell._md.innerHTML =
-              '<p class="retry-note">⏳ ' + label + " — retrying in <b>" + sec + 's</b>… <span class="retry-attempt">(attempt ' + attempt + ")</span></p>";
+              '<p class="retry-note">⏳ ' + escapeHtml(label) + " — retrying in <b>" + Number(sec) + 's</b>… <span class="retry-attempt">(attempt ' + Number(attempt) + ")</span></p>";
             autoScroll();
           },
           onContinue: () => {
@@ -792,6 +911,7 @@
           conv.messages.push({ role: "assistant", content: kept + "\n\n*(stopped)*" });
           saveChats();
         } else {
+          abortedEmpty = true;
           shell._md.innerHTML = '<p style="color:var(--text-dim)">*Stopped.*</p>';
         }
       } else if (partial) {
@@ -805,7 +925,7 @@
         // intact and offer a one-tap retry so nothing needs retyping.
         const msg = err.message || "Something went wrong.";
         shell._md.innerHTML =
-          '<p class="error-text">⚠️ ' + msg + "</p>" +
+          '<p class="error-text">⚠️ ' + escapeHtml(msg) + "</p>" +
           '<button class="retry-btn" type="button">↻ Try again</button>';
         const btn = shell._md.querySelector(".retry-btn");
         if (btn) btn.addEventListener("click", () => { if (!streaming) regenerateLast(); });
@@ -814,11 +934,13 @@
     } finally {
       streaming = false;
       abortCtrl = null;
-      const last = conv.messages[conv.messages.length - 1];
+      stopFaviconAnim();
+      const stillExists = chats.some(c => c.id === conv.id);
+      const last = stillExists && conv.messages.length ? conv.messages[conv.messages.length - 1] : null;
       const text = last && last.role === "assistant" ? last.content : (partial || full);
       if (gotFirst && text) shell._md.innerHTML = Markdown.render(text);
       shell._md.classList.remove("streaming-cursor");
-      addActions(shell, text || "", { regenerate: true });
+      if (!abortedEmpty && (text || "").trim()) addActions(shell, text || "", { regenerate: true });
       updateSendBtn();
       renderChatList();
       autoScroll();

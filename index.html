@@ -53,7 +53,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="css/styles.css?v=16">
+  <link rel="stylesheet" href="css/styles.css?v=17">
 
   <!-- Structured data: tells Google this is Blackwhole, an AI chat app by Mano Francis -->
   <script type="application/ld+json">
@@ -203,6 +203,9 @@
           <span class="model-badge" id="modelBadge">model/bw-m1-medium</span>
         </div>
         <div class="header-tools">
+          <button id="soundToggle" class="icon-btn" title="Toggle sound effects" aria-label="Toggle sound effects">
+            <svg id="soundIcon" viewBox="0 0 24 24"><path d="M11 5L6 9H2v6h4l5 4V5zM15.5 8.5a4.5 4.5 0 0 1 0 7M19 5a8 8 0 0 1 0 14"/></svg>
+          </button>
           <button id="themeToggle" class="icon-btn theme-toggle" title="Toggle theme" aria-label="Toggle theme">
             <svg id="themeIcon" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg>
           </button>
@@ -317,8 +320,15 @@
 
   <div id="toast" class="toast hidden"></div>
 
-  <script src="js/markdown.js?v=18"></script>
-  <script src="js/api.js?v=18"></script>
-  <script src="js/app.js?v=18"></script>
+  <script src="js/markdown.js?v=26"></script>
+  <script src="js/api.js?v=26"></script>
+  <script src="js/app.js?v=26"></script>
+  <script>
+    if ("serviceWorker" in navigator) {
+      window.addEventListener("load", () => {
+        navigator.serviceWorker.register("./sw.js").catch(() => {});
+      });
+    }
+  </script>
 </body>
 </html>

@@ -11,7 +11,12 @@
 
   function inline(s) {
     let out = escapeHtml(s);
-    out = out.replace(/`([^`]+)`/g, "<code>$1</code>");
+    // Protect inline code spans from bold/italic/link transformations.
+    const codes = [];
+    out = out.replace(/`([^`]+)`/g, (_, code) => {
+      codes.push("<code>" + code + "</code>");
+      return "\u0000C" + (codes.length - 1) + "\u0000";
+    });
     out = out.replace(/\*\*\*([^*]+)\*\*\*/g, "<strong><em>$1</em></strong>");
     out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
     out = out.replace(/(^|[^*\w])\*([^*\n]+)\*(?!\w)/g, "$1<em>$2</em>");
@@ -19,6 +24,7 @@
       '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
     out = out.replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g,
       '$1<a href="$2" target="_blank" rel="noopener noreferrer">$2</a>');
+    out = out.replace(/\u0000C(\d+)\u0000/g, (_, i) => codes[+i] || "");
     return out;
   }
 

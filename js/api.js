@@ -14,6 +14,14 @@
   const PROVIDERS = {
     // Default: our own worker proxy. noKey = the browser sends no API key;
     // the worker injects the secret key server-side.
+    pollinations: {
+      label: "Pollinations (Free, Unlimited)",
+      baseUrl: "https://text.pollinations.ai/openai",
+      defaultModel: "openai",
+      keyUrl: "",
+      style: "openai",
+      noKey: true,
+    },
     blackwhole: {
       label: "Blackwhole (Free)",
       baseUrl: PROXY_URL + "/v1",
@@ -75,37 +83,13 @@
      form-constrained writing (haiku, letter puzzles) shipped without
      self-verifying the constraint. */
   const ACCURACY_PROMPT =
-    "ACCURACY RULES — follow these always.\n" +
-    "1. Never fabricate quotes, letters, dialogues, report cards, or citations. " +
-    "Quote word-for-word ONLY what you are confident is authentic and verifiable; " +
-    "otherwise paraphrase and say it is paraphrased. Never cite a source you are " +
-    "not sure exists.\n" +
-    "2. Fast-changing facts (currencies, capital-city names, country names, " +
-    "officeholders, population/health statistics) go stale. Use the most recent " +
-    "value you know with confidence and state the year. Never present a superseded " +
-    "value as current — e.g. Croatia uses the euro (adopted 1 Jan 2023, kuna retired); " +
-    "Kazakhstan's capital is Astana again (renamed back in 2022). If unsure of the " +
-    "latest value, say so and give the last value you are sure of, with its year. " +
-    "For anything recent or current (news, events, releases, prices, \"latest\" " +
-    "versions, this week/month), call the web_search tool FIRST and cite the " +
-    "source URLs in the answer.\n" +
-    "3. For form-constrained writing (haiku, rhymes, acrostics, letter-avoidance, " +
-    "fixed counts), call the count_text tool on your draft and verify EVERY line " +
-    "against the constraint from its exact output — never count in your head; " +
-    "a haiku is exactly 5-7-5 syllables. If a line violates the constraint, " +
-    "silently rewrite it and re-check with the tool — never ship a line that " +
-    "breaks the requested form. If the tool is unavailable, say the count is an " +
-    "estimate.\n" +
-    "4. Do not invent people, events, numbers, or details to fill gaps. Saying " +
-    "\"I'm not certain\" is always better than a plausible-sounding guess.\n" +
-    "5. If a request is ambiguous or missing a key detail (which date? which " +
-    "version? which of several possible meanings?), ask ONE short clarifying " +
-    "question first instead of guessing. If the most likely reading is obvious, " +
-    "answer it and note the assumption in one line.\n" +
-    "6. If a tool call fails, returns an error or nothing useful, do NOT keep " +
-    "re-calling the same tool. Try at most one different query; if that also " +
-    "fails, tell the user briefly what happened and answer from what you " +
-    "already know, noting the uncertainty.";
+    "ACCURACY RULES — follow always.\n" +
+    "1. Never fabricate quotes, letters, dialogues, report cards, or citations. Quote verbatim only if confident; otherwise paraphrase and say so. Never cite a source you are not sure exists.\n" +
+    "2. Fast-changing facts (currencies, capitals, officeholders, populations) go stale. State the year of any value. Croatia uses the euro (2023); Kazakhstan's capital is Astana (2022). For recent/current topics (news, prices, \"latest\"), call the web_search tool FIRST and cite source URLs.\n" +
+    "3. For form-constrained writing (haiku 5-7-5, char/word limits), call the count_text tool on your draft and verify every line from its output — never count in your head. Rewrite and re-check if needed.\n" +
+    "4. Do not invent people, events, numbers. Saying \"I'm not certain\" beats a plausible guess.\n" +
+    "5. If a request is ambiguous, ask ONE short clarifying question first; if the reading is obvious, answer and note the assumption.\n" +
+    "6. If a tool fails, do not keep re-calling it. Try one different query; if that fails, say so briefly and answer from what you know.";
 
   /* Sent when a reply hits the token cap or a stream drops mid-answer. */
   const CONTINUE_PROMPT =
@@ -133,16 +117,56 @@
     const system = [IDENTITY_PROMPT, ACCURACY_PROMPT, cfg.systemPrompt, cfg.clientContext, systemExtra].filter(Boolean).join("\n\n");
 
     if (p.style === "anthropic") {
+      // Convert OpenAI-shaped history (tool_calls / tool results) into
+      // Anthropic's content-block shape so function calling works for this
+      // provider too.
+      const anthroMsgs = [];
+      for (const m of messages) {
+        if (m.role === "user") {
+          anthroMsgs.push({ role: "user", content: (typeof m.content === "string" ? m.content : (m.content ?? "")) });
+          continue;
+        }
+        if (m.role === "assistant") {
+          const blocks = [];
+          if (m.content) blocks.push({ type: "text", text: String(m.content) });
+          if (Array.isArray(m.tool_calls)) {
+            for (const tc of m.tool_calls) {
+              let input = {};
+              try { input = JSON.parse(tc.function && tc.function.arguments ? tc.function.arguments : "{}"); } catch { input = {}; }
+              blocks.push({ type: "tool_use", id: tc.id, name: (tc.function && tc.function.name) || tc.name, input });
+            }
+          }
+          if (!blocks.length) blocks.push({ type: "text", text: "" });
+          anthroMsgs.push({ role: "assistant", content: blocks });
+          continue;
+        }
+        if (m.role === "tool") {
+          const block = { type: "tool_result", tool_use_id: m.tool_call_id, content: String(m.content ?? "") };
+          const last = anthroMsgs[anthroMsgs.length - 1];
+          if (last && last.role === "user" && Array.isArray(last.content)) {
+            last.content.push(block);
+          } else {
+            anthroMsgs.push({ role: "user", content: [block] });
+          }
+          continue;
+        }
+        // skip system/other roles (system handled separately)
+      }
       const body = {
         model,
         max_tokens: 4096,
         temperature: cfg.temperature ?? 0.7,
         stream: true,
-        messages: messages
-          .filter(m => m.role === "user" || m.role === "assistant")
-          .map(m => ({ role: m.role, content: m.content })),
+        messages: anthroMsgs,
       };
       if (system) body.system = system;
+      if (cfg.tools && Array.isArray(cfg.tools.definitions) && cfg.tools.definitions.length) {
+        body.tools = cfg.tools.definitions.map(d => ({
+          name: d.function.name,
+          description: d.function.description,
+          input_schema: d.function.parameters || { type: "object", properties: {} },
+        }));
+      }
       return {
         url: base + "/messages",
         headers: {
@@ -233,13 +257,18 @@
       if (h) sec = Number(h);
     } catch { /* ignore */ }
     if (!Number.isFinite(sec)) {
-      // Matches "7.5s", "900 ms" and minute forms like "8m54.816s".
-      const m = /try again in\s+(?:(\d+)\s*m(?:in)?(?:utes)?)?\s*([\d.]+)\s*(ms|s|sec|seconds?)?/i.exec(detail || "");
-      if (m) {
-        const minutes = m[1] ? Number(m[1]) : 0;
-        const n = Number(m[2]);
-        const unit = (m[3] || "s").toLowerCase();
-        sec = minutes * 60 + (unit.startsWith("ms") ? n / 1000 : n);
+      const text = String(detail || "");
+      const anchor = /try again in\s+(.+)/i.exec(text);
+      const tail = anchor ? anchor[1] : text;
+      const mm = /(\d+(?:\.\d+)?)\s*(?:m|min|mins|minute|minutes)\b\s*(?:(\d+(?:\.\d+)?)\s*(?:s|sec|secs|second|seconds))?/i.exec(tail);
+      if (mm) {
+        sec = Number(mm[1]) * 60 + (mm[2] ? Number(mm[2]) : 0);
+      } else {
+        const ss = /(\d+(?:\.\d+)?)\s*(ms|msec|milliseconds?|s|sec|secs|second|seconds)\b/i.exec(tail);
+        if (ss) {
+          const n = Number(ss[1]);
+          sec = /^ms/i.test(ss[2]) ? n / 1000 : n;
+        }
       }
     }
     if (!Number.isFinite(sec) || sec <= 0) sec = 20;
@@ -305,7 +334,8 @@
 
   /* Rough token estimate (~4 chars/token) with small per-message overhead. */
   function estimateTokens(str) {
-    return Math.ceil(((str || "").length) / 4) + 4;
+    const s = (str == null) ? "" : (typeof str === "string" ? str : JSON.stringify(str));
+    return Math.ceil((s.length) / 4) + 4;
   }
 
   /* Keep only the most recent messages that fit within a token budget,
@@ -407,6 +437,26 @@
         if (delta) {
           full += delta;
           if (onDelta) onDelta(delta, full);
+        }
+        // Anthropic: tool_use blocks arrive via content_block_start / input_json_delta.
+        if (p.style === "anthropic") {
+          if (json.type === "content_block_start" && json.content_block && json.content_block.type === "tool_use") {
+            const cb = json.content_block;
+            const idx = (json.index != null ? json.index : Object.keys(toolAcc).length);
+            if (!toolAcc[idx]) toolAcc[idx] = { id: "", name: "", arguments: "" };
+            if (cb.id) toolAcc[idx].id = cb.id;
+            if (cb.name) toolAcc[idx].name = cb.name;
+          }
+          if (json.type === "content_block_delta" && json.delta && json.delta.type === "input_json_delta") {
+            const idx = (json.index != null ? json.index : (Object.keys(toolAcc).length - 1));
+            if (idx >= 0) {
+              if (!toolAcc[idx]) toolAcc[idx] = { id: "", name: "", arguments: "" };
+              toolAcc[idx].arguments += (json.delta.partial_json || "");
+            }
+          }
+          if (json.type === "message_delta" && json.delta && json.delta.stop_reason) {
+            finishReason = json.delta.stop_reason;
+          }
         }
         // Accumulate streamed tool_call fragments (OpenAI-compatible shape).
         const dToolCalls = choice && choice.delta && choice.delta.tool_calls;
@@ -511,8 +561,9 @@
       throw new Error("Custom provider needs a Base URL in Settings.");
     }
 
-    const isGroq = cfg.provider === "groq" || cfg.provider === "blackwhole";
+    let isGroq = cfg.provider === "groq" || cfg.provider === "blackwhole";
     // Groq free tier = ~8,000 tokens/minute. Keep the whole request small.
+    // Pollinations is unlimited/free; treat it like a non-Groq (large budget) provider.
     let budget = isGroq ? 1800 : 24000;
     let msgs = messages;
     let answer = "";
@@ -523,6 +574,7 @@
     let continuations = 0;
     let toolRounds = 0;
     let toolsDisabled = false;
+    let fellBack = false;
     const MAX_RETRIES = 6;
     const MAX_NET_RETRIES = 5;
     const MAX_SERVER_RETRIES = 3;
@@ -666,14 +718,42 @@
           continue;
         }
 
+        // Pollinations is "free/unlimited" but still returns 429 under load.
+        // Instead of making the user wait 20s, instantly fall back to the
+        // Blackwhole (Groq) proxy once.
+        if (cfg.provider === "pollinations" && err && err.status === 429 && !fellBack) {
+          fellBack = true;
+          cfg = { ...cfg, provider: "blackwhole" };
+          isGroq = true;
+          budget = 1800;
+          msgs = messages;
+          answer = "";
+          toolRounds = 0;
+          continuations = 0;
+          shrinks = 0;
+          retries = 0;
+          netRetries = 0;
+          serverRetries = 0;
+          continue;
+        }
+
         // Free-tier tokens-per-minute limit: wait for the window to reset,
-        // trim a little more, and retry automatically.
+        // trim a little more, and retry automatically. Keep waits short so
+        // the chat never feels stuck (instant UX).
         if (err && err.status === 429 && retries < MAX_RETRIES) {
           retries++;
-          const waitSec = Math.min(Math.ceil(err.retryAfter || 20), 660);
+          const cap = (cfg.provider === "blackwhole") ? 5 : 660;
+          const waitSec = Math.min(Math.ceil(err.retryAfter || 5), cap);
           if (handlers.onRetry) handlers.onRetry(waitSec, retries, "rate");
           await delay(waitSec * 1000, handlers.signal);
           budget = Math.max(1000, Math.floor(budget * 0.8));
+          // Fail fast after a couple of rate-limit hits instead of
+          // hammering the (free) provider for 6 rounds.
+          if (retries >= 2) {
+            throw new Error(cfg.provider === "blackwhole"
+              ? "The free AI service is busy right now. Please try again in a moment."
+              : "Rate limit didn't clear. Please try again in a moment.");
+          }
           continue;
         }
 
@@ -704,6 +784,25 @@
           const waitSec = Math.min(Math.ceil(err.retryAfter || backoffSec(serverRetries)), 90);
           if (handlers.onRetry) handlers.onRetry(waitSec, serverRetries, "server");
           await delay(waitSec * 1000, handlers.signal);
+          continue;
+        }
+
+        // Instant unlimited fallback: if the free primary (Pollinations) fails,
+        // switch to the Blackwhole proxy once instead of waiting on rate limits.
+        if (cfg.provider === "pollinations" && !fellBack &&
+            (err && (err.retryable || (err.status && err.status >= 500) || !err.status))) {
+          fellBack = true;
+          cfg = { ...cfg, provider: "blackwhole" };
+          isGroq = true;
+          budget = 1800;
+          msgs = messages;
+          answer = "";
+          toolRounds = 0;
+          continuations = 0;
+          shrinks = 0;
+          retries = 0;
+          netRetries = 0;
+          serverRetries = 0;
           continue;
         }
 
@@ -962,7 +1061,7 @@
       type: "function",
       function: {
         name: "get_current_datetime",
-        description: "Get the accurate current date and time. Use for any question about the time or date, including other cities or timezones (pass their IANA timezone, e.g. Asia/Kolkata, America/New_York).",
+        description: "Get accurate current date/time for a timezone (IANA, e.g. Asia/Kolkata).",
         parameters: {
           type: "object",
           properties: {
@@ -976,7 +1075,7 @@
       type: "function",
       function: {
         name: "get_weather",
-        description: "Get live weather right now plus today's and tomorrow's forecast for a city or place. Use for any weather question.",
+        description: "Live weather + today/tomorrow forecast for a city/place.",
         parameters: {
           type: "object",
           properties: {
@@ -990,7 +1089,7 @@
       type: "function",
       function: {
         name: "count_text",
-        description: "Exactly counts characters (with/without spaces), words, sentences, per-line syllables (English estimate) and letter frequencies of a text. ALWAYS call this on your draft before sending any answer with a count constraint: haiku (5-7-5), character limits, word limits, letter puzzles, acrostics. Pass the exact draft text, with each haiku line on its own line.",
+        description: "Exact counts (chars, words, sentences, per-line syllables, letter freq). Call on drafts with count constraints (haiku 5-7-5, char/word limits).",
         parameters: {
           type: "object",
           properties: {
@@ -1004,7 +1103,7 @@
       type: "function",
       function: {
         name: "web_search",
-        description: "Search the live web (current news, events, prices, latest versions, anything after your training data). Returns ~5 results with title, url and snippet. Call this FIRST whenever the user asks about anything recent or current, then cite the source URLs in your answer.",
+        description: "Live web search (~5 results). Call FIRST for recent/current topics; cite source URLs.",
         parameters: {
           type: "object",
           properties: {
@@ -1018,7 +1117,7 @@
       type: "function",
       function: {
         name: "read_webpage",
-        description: "Read the full text of a webpage by URL (use after web_search when a snippet is not enough). Returns plain text, capped at ~8000 characters.",
+        description: "Read full text of a URL (~8k cap). Use after web_search when snippets aren't enough.",
         parameters: {
           type: "object",
           properties: {
@@ -1032,7 +1131,7 @@
       type: "function",
       function: {
         name: "remember",
-        description: "Save an important, durable fact about the user (name, preferences, projects, goals, corrections about you) to long-term memory, so future chats remember it. Call when the user shares something worth remembering (\"my name is…\", \"I prefer…\", \"I'm working on…\") or asks you to remember something. Do NOT save trivial or short-lived chat details.",
+        description: "Save a durable fact about the user to long-term memory (name, prefs, projects).",
         parameters: {
           type: "object",
           properties: {
@@ -1046,7 +1145,7 @@
       type: "function",
       function: {
         name: "forget",
-        description: "Delete facts from long-term memory. Call when the user asks you to forget something or corrects a stored fact. Pass matching text (substring match); call with no argument to clear ALL memory.",
+        description: "Delete facts from long-term memory (substring match; no arg clears all).",
         parameters: {
           type: "object",
           properties: {

@@ -674,6 +674,9 @@ body, .chat-header, .composer, .modal, .suggestion, .user-bubble,
   margin: 0 auto;
   padding: 15px 26px;
   animation: msg-in .38s cubic-bezier(.2,.8,.2,1) both;
+  /* Virtualization: skip layout/paint for off-screen messages. */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 80px;
 }
 @keyframes msg-in { from { opacity: 0; transform: translateY(9px); } }
 
@@ -746,6 +749,26 @@ html[data-theme="dark"] .user-bubble {
   0%,60%,100% { transform: translateY(0); opacity: .35; }
   30% { transform: translateY(-5px); opacity: 1; }
 }
+.typing-label {
+  display: inline-block;
+  margin-left: 8px;
+  font-size: .82rem;
+  color: var(--text-dim);
+  font-style: italic;
+  animation: retry-pulse 1.4s ease-in-out infinite;
+}
+/* skeleton shimmer for assistant bubble while waiting */
+.skeleton-line {
+  height: 12px;
+  border-radius: 6px;
+  background: linear-gradient(90deg, var(--surface-2, rgba(255,255,255,.06)) 0%, var(--accent-soft, rgba(255,255,255,.12)) 50%, var(--surface-2, rgba(255,255,255,.06)) 100%);
+  background-size: 200% 100%;
+  animation: shimmer 1.6s infinite;
+  margin: 6px 0;
+}
+.skeleton-line.short { width: 60%; }
+.skeleton-line.med { width: 85%; }
+@keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
 
 .md .error-text { color: var(--danger); }
 
