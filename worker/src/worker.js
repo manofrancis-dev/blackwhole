@@ -16,6 +16,14 @@
      ALLOWED_ORIGINS         Comma-separated origins allowed to call this proxy. */
 
 const GROQ_BASE = "https://api.groq.com/openai/v1";
+
+/* Free Groq quotas are applied PER MODEL, so every model below is an
+   independent quota bucket. When one bucket is exhausted the proxy hops to
+   the next one with zero delay — the browser never sees a 429 for a model
+   rotation. A bucket that recently said 429 is remembered for a short while
+   so later requests start on a usable model instead of burning a request. */
+const MODEL_POOL = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"];
+const modelCooldown = new Map(); // model -> epoch ms when it may be usable again
 const BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 /* ---------- HTML helpers for the keyless web tools ---------- */
@@ -493,37 +501,93 @@ async function handle(request, env) {
     const path = url.pathname.replace(/^\/v1\/?/, "");
     if (!path) return json({ error: { message: "Unknown path." } }, 404, cors);
 
-    /* Transient upstream failures (connection resets, Groq 5xx/429) are
-       retried HERE with a short backoff, before anything streams, so a
-       momentary hiccup never reaches the visitor as an error. Non-retryable
-       client errors (400/401/403/413/422…) pass through untouched so the
-       frontend's own handling keeps working. */
-    const body = await request.text();
-    const ATTEMPTS = 3;
+    /* Transient upstream failures (connection resets, Groq 5xx) are retried
+       HERE with a short backoff, before anything streams, so a momentary
+       hiccup never reaches the visitor as an error. Rate limits (429) are
+       NOT retried on the same model — they rotate to the next quota bucket
+       immediately. Non-retryable client errors (400/401/403/413/422…) pass
+       through untouched so the frontend's own handling keeps working. */
+    const rawBody = await request.text();
+
+    /* Only chat completions carry a model worth rotating; every other path
+       is proxied exactly as before. */
+    let bodyObj = null;
+    try { bodyObj = JSON.parse(rawBody); } catch { bodyObj = null; }
+    const isChat = /chat\/completions$/.test(path) && bodyObj && Array.isArray(bodyObj.messages);
+    const requested = (isChat && typeof bodyObj.model === "string" && bodyObj.model) || MODEL_POOL[0];
+    const now = Date.now();
+    const order = [requested, ...MODEL_POOL.filter(m => m !== requested)];
+    const sequence = isChat
+      ? order.filter(m => (modelCooldown.get(m) || 0) <= now)
+          .concat(order.filter(m => (modelCooldown.get(m) || 0) > now))
+      : [requested];
+
     let lastUpstream = null; // last retryable response (for pass-through on exhaust)
     let lastConnError = null; // last connection-level failure
-    for (let i = 0; i < ATTEMPTS; i++) {
-      let upstream;
-      try {
-        upstream = await fetch(GROQ_BASE + "/" + path, {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            "authorization": "Bearer " + env.GROQ_API_KEY,
-          },
-          body,
-        });
-      } catch (e) {
-        // Connection-level failure (DNS, TLS, reset) -> back off and retry.
-        lastConnError = e;
-        await sleep(400 * (i + 1));
-        continue;
-      }
+    let sawRateLimit = false;
 
-      if (upstream.ok) {
-        // Success: pass everything through — SSE bodies stream straight to
-        // the browser (mid-stream drops are healed by the client's
-        // partial-answer + automatic-continue logic).
+    for (const model of sequence) {
+      const body = isChat && model !== requested
+        ? JSON.stringify({ ...bodyObj, model })
+        : rawBody;
+
+      for (let attempt = 0; attempt < 2; attempt++) {
+        let upstream;
+        try {
+          upstream = await fetch(GROQ_BASE + "/" + path, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "authorization": "Bearer " + env.GROQ_API_KEY,
+            },
+            body,
+          });
+        } catch (e) {
+          // Connection-level failure (DNS, TLS, reset) -> short backoff, then
+          // give up on this model and let the next bucket try.
+          lastConnError = e;
+          if (attempt === 0) { await sleep(250); continue; }
+          break;
+        }
+
+        if (upstream.ok) {
+          // Success: pass everything through — SSE bodies stream straight to
+          // the browser (mid-stream drops are healed by the client's
+          // partial-answer + automatic-continue logic).
+          const headers = new Headers(cors);
+          const ct = upstream.headers.get("content-type");
+          if (ct) headers.set("content-type", ct);
+          const ra = upstream.headers.get("retry-after");
+          if (ra) headers.set("retry-after", ra);
+          return new Response(upstream.body, { status: upstream.status, headers });
+        }
+
+        if (upstream.status === 429) {
+          // Quota bucket empty. Remember it briefly, then hop to the next
+          // model IMMEDIATELY — no sleep, no Retry-After wait, so the user
+          // never sees a countdown or a "busy" message.
+          const errText = await upstream.text().catch(() => "");
+          const ra = Number(upstream.headers.get("retry-after"));
+          lastUpstream = { status: 429, ra, errText, ct: upstream.headers.get("content-type") };
+          sawRateLimit = true;
+          const coolMs = Number.isFinite(ra) && ra > 0 ? ra * 1000 : 15000;
+          modelCooldown.set(model, Date.now() + Math.min(coolMs, 60000));
+          break; // next bucket, zero wait
+        }
+
+        if (upstream.status >= 500) {
+          // Retryable upstream state. Capture the small error body now (it
+          // cannot be re-read later), then back off briefly.
+          const errText = await upstream.text().catch(() => "");
+          const ra = Number(upstream.headers.get("retry-after"));
+          lastUpstream = { status: upstream.status, ra, errText, ct: upstream.headers.get("content-type") };
+          if (attempt === 0) { await sleep(300); continue; }
+          break; // next bucket
+        }
+
+        // Non-retryable (400/401/403/413/422…): pass the error through WITH
+        // CORS so the browser can read the real cause instead of masking it
+        // as a network failure.
         const headers = new Headers(cors);
         const ct = upstream.headers.get("content-type");
         if (ct) headers.set("content-type", ct);
@@ -531,34 +595,42 @@ async function handle(request, env) {
         if (ra) headers.set("retry-after", ra);
         return new Response(upstream.body, { status: upstream.status, headers });
       }
+    }
 
-      if (upstream.status >= 500 || upstream.status === 429) {
-        // Retryable upstream state. Capture the small error body now (it
-        // cannot be re-read later), then back off — honouring Groq's
-        // Retry-After on 429, capped so the browser never times out.
-        const errText = await upstream.text().catch(() => "");
-        const ra = Number(upstream.headers.get("retry-after"));
-        lastUpstream = { status: upstream.status, ra, errText, ct: upstream.headers.get("content-type") };
-        await sleep(Number.isFinite(ra) && ra > 0 ? Math.min(ra * 1000, 5000) : 400 * (i + 1));
-        continue;
-      }
-
-      // Non-retryable (400/401/403/413/422…): pass the error through WITH
-      // CORS so the browser can read the real cause instead of masking it
-      // as a network failure.
-      const headers = new Headers(cors);
-      const ct = upstream.headers.get("content-type");
-      if (ct) headers.set("content-type", ct);
-      const ra = upstream.headers.get("retry-after");
-      if (ra) headers.set("retry-after", ra);
-      return new Response(upstream.body, { status: upstream.status, headers });
+    /* Last resort: every Groq bucket is limited at once. The keyless
+       Pollinations endpoint is a completely separate free quota, so try it
+       before giving up. Tools are stripped (it does not support function
+       calling), which still yields a normal written answer. */
+    if (isChat && (sawRateLimit || lastConnError)) {
+      try {
+        const alt = { ...bodyObj, model: "openai" };
+        delete alt.tools;
+        delete alt.tool_choice;
+        delete alt.functions;
+        delete alt.function_call;
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 12000);
+        const res = await fetch("https://text.pollinations.ai/openai", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(alt),
+          signal: ctrl.signal,
+        });
+        clearTimeout(timer);
+        if (res.ok) {
+          const headers = new Headers(cors);
+          const ct = res.headers.get("content-type");
+          if (ct) headers.set("content-type", ct);
+          return new Response(res.body, { status: 200, headers });
+        }
+      } catch { /* fall through to the upstream error below */ }
     }
 
     // All attempts exhausted:
     // - A real upstream 429/5xx is passed through verbatim (status +
-    //   Retry-After) so the client's auto-retry logic works as designed.
+    //   Retry-After) so the client's own rotation logic still works.
     // - Connection-level failures get a CORS JSON 502 with a Retry-After
-    //   hint — also auto-retried by the client.
+    //   hint — also handled by the client.
     if (lastUpstream) {
       const headers = new Headers(cors);
       if (lastUpstream.ct) headers.set("content-type", lastUpstream.ct);

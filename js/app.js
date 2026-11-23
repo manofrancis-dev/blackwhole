@@ -871,14 +871,6 @@
         conv.messages,
         {
           onDelta: (_delta, all) => { partial = all; paint(all); },
-          onRetry: (sec, attempt, reason) => {
-            const label = reason === "reconnect" ? "Connection hiccup — reconnecting"
-              : reason === "server" ? "AI service busy"
-              : "Free-tier limit hit";
-            shell._md.innerHTML =
-              '<p class="retry-note">⏳ ' + escapeHtml(label) + " — retrying in <b>" + Number(sec) + 's</b>… <span class="retry-attempt">(attempt ' + Number(attempt) + ")</span></p>";
-            autoScroll();
-          },
           onContinue: () => {
             shell._md.innerHTML =
               '<p class="retry-note">⏳ Continuing the answer…</p>';

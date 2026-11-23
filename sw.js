@@ -1,5 +1,5 @@
 /* Blackwhole service worker — caches the app shell for offline use. */
-const CACHE = "blackwhole-shell-v1";
+const CACHE = "blackwhole-shell-v2";
 const SHELL = [
   "./",
   "./index.html",

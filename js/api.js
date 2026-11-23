@@ -26,6 +26,10 @@
       label: "Blackwhole (Free)",
       baseUrl: PROXY_URL + "/v1",
       defaultModel: "openai/gpt-oss-120b",
+      /* Free-tier limits are applied PER MODEL, so every entry here is its
+         own independent quota bucket. When one is exhausted the client hops
+         to the next instantly — no countdown, no error, no visible pause. */
+      fallbackModels: ["openai/gpt-oss-120b", "openai/gpt-oss-20b"],
       keyUrl: "",
       style: "openai",
       noKey: true,
@@ -310,9 +314,10 @@
       throw e;
     }
 
-    // Tokens-per-minute limit — the client waits and retries automatically.
+    // Tokens-per-minute limit. Never surfaced to the visitor: streamChat
+    // switches to the next quota bucket instantly and silently.
     if (res.status === 429 || /rate limit|tokens per minute|too many requests/i.test(detail)) {
-      const e = new Error("Free-tier rate limit reached. Retrying automatically…");
+      const e = new Error("Switching to a faster route…");
       e.status = 429;
       e.retryAfter = parseRetryAfter(res, detail);
       throw e;
@@ -322,7 +327,7 @@
     // restarting) — automatically retried with backoff by streamChat, so a
     // transient 5xx never reaches the visitor as a dead end.
     if (res.status === 408 || res.status >= 500) {
-      const e = new Error("Blackwhole's AI service is briefly busy. Retrying automatically…");
+      const e = new Error("Reconnecting…");
       e.status = res.status;
       e.retryable = true;
       e.retryAfter = parseRetryAfter(res, detail);
@@ -536,16 +541,16 @@
   /**
    * Stream a chat completion. Long conversations are trimmed to fit the plan's
    * tokens-per-minute (TPM) limit, and free-tier rate limits are handled
-   * automatically: the client waits and retries instead of failing.
+   * invisibly: the request hops to the next free quota bucket instantly, so
+   * the visitor never sees a countdown, a cooldown or a "service busy" note.
    * If the model stops because it hit the token cap (finish_reason=length) or
    * the connection drops mid-answer, the answer is continued automatically so
    * the user never gets a half-finished reply.
    * @param {object} cfg  {provider, apiKey, baseUrl, model, systemPrompt, temperature,
    *                      clientContext, tools: {definitions, execute(name, args)}}
    * @param {Array}  messages  [{role:'user'|'assistant', content}]
-   * @param {object} handlers  {onDelta(text, full), onRetry(seconds, attempt, reason), onContinue(n),
+   * @param {object} handlers  {onDelta(text, full), onContinue(n),
    *                            onToolCall(name), onTruncated(), signal}
-   *                            reason: "rate" | "reconnect" | "server"
    * @returns {Promise<string>} full assistant text
    */
   async function streamChat(cfg, messages, handlers = {}) {
@@ -574,12 +579,58 @@
     let continuations = 0;
     let toolRounds = 0;
     let toolsDisabled = false;
-    let fellBack = false;
     const MAX_RETRIES = 6;
     const MAX_NET_RETRIES = 5;
     const MAX_SERVER_RETRIES = 3;
     const MAX_CONTINUATIONS = 4;
     const MAX_TOOL_ROUNDS = 3;
+
+    /* ---------- Silent instant rotation (free mode) ----------
+       Free endpoints are rate limited per model, and every model is its own
+       quota bucket. A 429 therefore never means "wait": it means "use the
+       next bucket", which happens in the same tick — no countdown, no
+       "service busy" bubble, no cooldown the visitor can see. If every
+       bucket is limited at once we loop the chain a few times, still
+       silently (the normal typing indicator stays on screen). */
+    const FREE_CHAIN = (() => {
+      const chain = [];
+      const models = (PROVIDERS.blackwhole.fallbackModels || [PROVIDERS.blackwhole.defaultModel]);
+      for (const m of models) chain.push({ provider: "blackwhole", model: m });
+      chain.push({ provider: "pollinations", model: PROVIDERS.pollinations.defaultModel });
+      return chain;
+    })();
+    const freeMode = cfg.provider === "blackwhole" || cfg.provider === "pollinations";
+    const startProvider = cfg.provider;
+    const startModel = cfg.model || "";
+    let chainIdx = FREE_CHAIN.findIndex(e => e.provider === startProvider && e.model === startModel);
+    if (chainIdx < 0) chainIdx = 0;
+    let silentPasses = 0;
+    const MAX_SILENT_PASSES = 5;
+
+    function applyEndpoint(entry) {
+      cfg = { ...cfg, provider: entry.provider, model: entry.model, apiKey: "" };
+      isGroq = entry.provider === "blackwhole";
+      budget = isGroq ? 1800 : 24000;
+      msgs = messages;
+      toolRounds = 0;
+      continuations = 0;
+      shrinks = 0;
+      toolsDisabled = false;
+    }
+
+    /* Move to the next quota bucket. Returns false when the chain is spent. */
+    function rotateEndpoint() {
+      if (chainIdx + 1 >= FREE_CHAIN.length) return false;
+      chainIdx++;
+      applyEndpoint(FREE_CHAIN[chainIdx]);
+      return true;
+    }
+
+    /* Restart the chain from the visitor's original choice. */
+    function restartChain() {
+      chainIdx = Math.max(0, FREE_CHAIN.findIndex(e => e.provider === startProvider && e.model === startModel));
+      applyEndpoint(FREE_CHAIN[chainIdx]);
+    }
 
     /* Exponential backoff with jitter for transient failures:
        ~1s, 2s, 4s, 8s, 16s — capped so retries stay responsive. */
@@ -718,62 +769,52 @@
           continue;
         }
 
-        // Pollinations is "free/unlimited" but still returns 429 under load.
-        // Instead of making the user wait 20s, instantly fall back to the
-        // Blackwhole (Groq) proxy once.
-        if (cfg.provider === "pollinations" && err && err.status === 429 && !fellBack) {
-          fellBack = true;
-          cfg = { ...cfg, provider: "blackwhole" };
-          isGroq = true;
-          budget = 1800;
-          msgs = messages;
-          answer = "";
-          toolRounds = 0;
-          continuations = 0;
-          shrinks = 0;
-          retries = 0;
-          netRetries = 0;
-          serverRetries = 0;
-          continue;
+        /* ---------- Free mode: instant, silent rotation ----------
+           A rate limit (429), a model that isn't available on this key
+           (404), an overloaded upstream (5xx) or a dropped connection is
+           never shown to the visitor: we jump to the next quota bucket in
+           the same tick. No countdown, no "service busy", no cooldown. */
+        if (freeMode && err && (
+              err.status === 429 ||
+              err.status === 404 ||
+              err.status === 408 ||
+              (err.status && err.status >= 500) ||
+              (err.retryable && !err.status)
+            )) {
+          // Mid-answer: keep what the model already wrote rather than
+          // restarting (a restart would duplicate text).
+          if (!answer.trim()) {
+            if (rotateEndpoint()) continue; // next bucket, zero wait
+            // Every bucket is limited at this instant. Loop the whole chain
+            // again, still silently (the typing indicator stays up), and
+            // only admit defeat after several passes so a short spike never
+            // reaches the visitor.
+            if (silentPasses < MAX_SILENT_PASSES) {
+              silentPasses++;
+              restartChain();
+              await delay(Math.min(400 * silentPasses, 2000), handlers.signal);
+              continue;
+            }
+            throw new Error("Couldn't reach the AI just now. Tap Try again.");
+          }
         }
 
-        // Free-tier tokens-per-minute limit: wait for the window to reset,
-        // trim a little more, and retry automatically. Keep waits short so
-        // the chat never feels stuck (instant UX).
+        // Rate limit on a visitor-configured (paid) provider: wait for the
+        // window to reset and retry, keeping the normal typing indicator up.
         if (err && err.status === 429 && retries < MAX_RETRIES) {
           retries++;
-          const cap = (cfg.provider === "blackwhole") ? 5 : 660;
-          const waitSec = Math.min(Math.ceil(err.retryAfter || 5), cap);
-          if (handlers.onRetry) handlers.onRetry(waitSec, retries, "rate");
+          const waitSec = Math.min(Math.ceil(err.retryAfter || 5), 30);
           await delay(waitSec * 1000, handlers.signal);
           budget = Math.max(1000, Math.floor(budget * 0.8));
-          // Fail fast after a couple of rate-limit hits instead of
-          // hammering the (free) provider for 6 rounds.
-          if (retries >= 2) {
-            throw new Error(cfg.provider === "blackwhole"
-              ? "The free AI service is busy right now. Please try again in a moment."
-              : "Rate limit didn't clear. Please try again in a moment.");
-          }
           continue;
-        }
-
-        // Rate limit still failing after every retry (usually the free
-        // plan's daily token quota): stop with an honest message instead of
-        // claiming "retrying automatically…" one last time.
-        if (err && err.status === 429) {
-          throw new Error(cfg.provider === "blackwhole"
-            ? "The free AI quota is used up right now. Please try again in a few minutes."
-            : "Rate limit didn't clear after several retries. Please try again in a few minutes.");
         }
 
         // Transient network hiccup (connection reset, DNS blip, our proxy
-        // briefly unreachable): back off and retry automatically, so a
-        // momentary outage never surfaces as an error for the visitor.
+        // briefly unreachable): retry automatically, so a momentary outage
+        // never surfaces as an error for the visitor.
         if (err && err.retryable && !err.status && netRetries < MAX_NET_RETRIES) {
           netRetries++;
-          const waitSec = backoffSec(netRetries);
-          if (handlers.onRetry) handlers.onRetry(waitSec, netRetries, "reconnect");
-          await delay(waitSec * 1000, handlers.signal);
+          await delay(backoffSec(netRetries) * 1000, handlers.signal);
           continue;
         }
 
@@ -781,28 +822,8 @@
         // retry treatment, honouring any Retry-After hint.
         if (err && err.retryable && err.status && serverRetries < MAX_SERVER_RETRIES) {
           serverRetries++;
-          const waitSec = Math.min(Math.ceil(err.retryAfter || backoffSec(serverRetries)), 90);
-          if (handlers.onRetry) handlers.onRetry(waitSec, serverRetries, "server");
+          const waitSec = Math.min(Math.ceil(err.retryAfter || backoffSec(serverRetries)), 30);
           await delay(waitSec * 1000, handlers.signal);
-          continue;
-        }
-
-        // Instant unlimited fallback: if the free primary (Pollinations) fails,
-        // switch to the Blackwhole proxy once instead of waiting on rate limits.
-        if (cfg.provider === "pollinations" && !fellBack &&
-            (err && (err.retryable || (err.status && err.status >= 500) || !err.status))) {
-          fellBack = true;
-          cfg = { ...cfg, provider: "blackwhole" };
-          isGroq = true;
-          budget = 1800;
-          msgs = messages;
-          answer = "";
-          toolRounds = 0;
-          continuations = 0;
-          shrinks = 0;
-          retries = 0;
-          netRetries = 0;
-          serverRetries = 0;
           continue;
         }
 
